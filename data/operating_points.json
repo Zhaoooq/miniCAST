@@ -1,0 +1,46 @@
+[
+    {
+        "createdAt": "2026-09-08T16:07:52Z",
+        "description": "旧运行点，尚未确认 MFC 地址映射",
+        "id": "legacy-unmapped-1",
+        "isDefault": false,
+        "legacyUnmappedValues": {
+            "dilutionAir": 4,
+            "fuelGas": 20,
+            "mixingGas": 6,
+            "oxidationAir": 0.65,
+            "quenchGas": 2
+        },
+        "mfcSetpoints": {
+        },
+        "name": "旧运行点 1（待地址确认）",
+        "readOnly": false,
+        "requiresAddressMapping": true,
+        "schemaVersion": 3,
+        "type": "Customer",
+        "typeText": "客户运行点",
+        "updatedAt": "2026-09-10T07:43:56Z"
+    },
+    {
+        "createdAt": "2026-09-10T07:44:08Z",
+        "description": "旧运行点，尚未确认 MFC 地址映射",
+        "id": "legacy-unmapped-2",
+        "isDefault": false,
+        "legacyUnmappedValues": {
+            "dilutionAir": 5,
+            "fuelGas": 32,
+            "mixingGas": 0,
+            "oxidationAir": 0.75,
+            "quenchGas": 2
+        },
+        "mfcSetpoints": {
+        },
+        "name": "旧运行点 2（待地址确认）",
+        "readOnly": false,
+        "requiresAddressMapping": true,
+        "schemaVersion": 3,
+        "type": "Customer",
+        "typeText": "客户运行点",
+        "updatedAt": "2026-09-10T07:44:08Z"
+    }
+]

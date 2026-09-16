@@ -1,0 +1,24 @@
+{
+  "application": { "windowMode": 0, "language": "zh_CN" },
+  "monitoring": { "sampleIntervalMs": 500 },
+  "flowAlarm": { "warningDeviationPercent": 5.0, "criticalDeviationPercent": 10.0, "zeroFlowTolerance": 0.02 },
+  "mfc": {
+    "serialPort": "auto",
+    "preferredBaud": 19200,
+    "ackTimeoutMs": 40,
+    "responseTimeoutMs": 180,
+    "retryCount": 1,
+    "interRequestDelayMs": 20,
+    "freshnessTimeoutMs": 3000,
+    "offlineFailureThreshold": 3,
+    "reconnectIntervalMs": 3000,
+    "settlingTimeMs": 3000,
+    "devices": [
+      { "address": 32, "displayName": "MFC1", "gasType": "空气", "function": "发生器空气", "unit": "L/min", "fullScale": 1, "gasCode": 8, "expectedDeviceFullScaleSccm": 1000, "minSetpoint": 0, "maxSetpoint": 1, "addressConfirmed": true, "enabled": true, "required": true },
+      { "address": 33, "displayName": "MFC2", "gasType": "丙烷", "function": "燃料气", "unit": "ml/min", "fullScale": 50, "gasCode": 89, "expectedDeviceFullScaleSccm": 50, "minSetpoint": 0, "maxSetpoint": 50, "addressConfirmed": true, "enabled": true, "required": true },
+      { "address": 34, "displayName": "MFC3", "gasType": "氮气", "function": "稀释气", "unit": "ml/min", "fullScale": 50, "gasCode": 13, "expectedDeviceFullScaleSccm": 50, "minSetpoint": 0, "maxSetpoint": 50, "addressConfirmed": true, "enabled": true, "required": true },
+      { "address": 35, "displayName": "MFC4", "gasType": "空气", "function": "发生器空气", "unit": "L/min", "fullScale": 10, "gasCode": 8, "expectedDeviceFullScaleSccm": 10000, "minSetpoint": 0, "maxSetpoint": 10, "addressConfirmed": true, "enabled": true, "required": true },
+      { "address": 36, "displayName": "MFC5", "gasType": "氮气", "function": "稀释气", "unit": "L/min", "fullScale": 4, "gasCode": 13, "expectedDeviceFullScaleSccm": 4000, "minSetpoint": 0, "maxSetpoint": 4, "addressConfirmed": true, "enabled": true, "required": true }
+    ]
+  }
+}

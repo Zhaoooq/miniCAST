@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=高浓度碳烟发生器监测系统
+Comment=高浓度碳烟发生器实时监测软件
+Exec=minicast-monitor
+Icon=utilities-system-monitor
+Terminal=false
+Type=Application
+Categories=Science;Education;
+StartupNotify=true

@@ -1,0 +1,20 @@
+# CMake and IDE build products
+build/
+build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Application runtime records (keep directory placeholders)
+data/logs/*
+!data/logs/.gitkeep
+data/exports/*
+!data/exports/.gitkeep
+data/alarms/*
+!data/alarms/.gitkeep
+
+# Local/editor files
+.DS_Store
+*.user
+*.swp
