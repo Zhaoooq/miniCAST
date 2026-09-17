@@ -10,7 +10,6 @@ Item {
     signal operatingPointsRequested()
     property int selectedCategory: 0
     property var categories: ["系统设置", "运行点管理", "设备设置", "显示设置", "数据管理", "维护 / 通信诊断", "关于软件"]
-    property bool autoMonitoring: false
     property int pendingConfirmAddress: -1
     property bool diagnosticsDialogPending: false
 
@@ -218,22 +217,6 @@ Item {
         id: systemPane
         ColumnLayout {
             anchors.fill: parent; spacing: 0
-            SettingsRow {
-                label: "语言"
-                HmiComboBox {
-                    anchors.left: parent.left; anchors.leftMargin: 14; anchors.verticalCenter: parent.verticalCenter
-                    implicitWidth: 150; implicitHeight: 28; font.pixelSize: 11
-                    model: ["中文（简体）", "English"]
-                }
-            }
-            SettingsRow {
-                label: "自动监测"
-                HmiToggle {
-                    anchors.left: parent.left; anchors.leftMargin: 14; anchors.verticalCenter: parent.verticalCenter
-                    checked: root.autoMonitoring; text: "开机后自动开始监测"
-                    onToggled: root.autoMonitoring = checked
-                }
-            }
             SettingsRow {
                 label: "轮询周期"
                 HmiComboBox {
