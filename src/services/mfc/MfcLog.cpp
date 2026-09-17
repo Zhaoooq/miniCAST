@@ -1,5 +1,6 @@
 #include "MfcLog.h"
 #include <QDateTime>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QTextStream>
@@ -37,10 +38,16 @@ void MfcLog::write(const QString &message)
         || message.contains(QStringLiteral(" TX attempt="))
         || message.contains(QStringLiteral(" RX_BYTES "))
         || message.contains(QStringLiteral(" RX_FRAME_COMPLETE "));
-    if (rawFrame && !m_rawFramesEnabled) return;
+    // Transport lifecycle and per-request diagnostics are required in the
+    // normal monitor log.  Keep the legacy raw-frame switch only for unrelated
+    // old-format raw lines.
+    if (rawFrame && !m_rawFramesEnabled && !message.startsWith(QStringLiteral("[transport]"))) return;
     rotateIfNeeded();
     QFile file(path());
     if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) return;
     QTextStream stream(&file);
     stream << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << ' ' << message << '\n';
+    // The launcher captures Qt's message stream as minicast_startup.log.  Send
+    // the exact transport timeline there as well as to mfc-communication.log.
+    qInfo().noquote() << message;
 }

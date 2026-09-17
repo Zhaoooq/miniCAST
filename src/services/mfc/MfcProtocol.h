@@ -87,6 +87,7 @@ Response parseResponse(const QByteArray &packet, quint8 expectedClass,
 double decodeUfrac16(quint16 raw);
 quint16 encodeUfrac16(double fraction);
 quint16 readUInt16Le(const QByteArray &data);
+quint8 readUInt8(const QByteArray &data);
 qint32 readInt32Le(const QByteArray &data);
 double decodeFixed16_16(const QByteArray &data);
 QString decodeText(const QByteArray &data);

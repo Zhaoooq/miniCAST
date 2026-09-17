@@ -35,7 +35,7 @@ public:
     quint16 readCalibrationGasCode();
     quint16 readCalibrationGasFullScale();
     double readConversionFactor();
-    quint16 readRs485MacAddress();
+    quint8 readRs485MacAddress();
     quint16 readBaudRate();
     void setTransactionOptions(int ackTimeoutMs, int responseTimeoutMs, int retries);
     void setEngineeringScale(double fullScale, const QString &unit);
@@ -44,6 +44,7 @@ private:
     SerialTransport &transport();
     MfcProtocol::Response readAttribute(quint8 commandClass, quint8 attribute);
     quint16 readUInt16(quint8 commandClass, quint8 attribute);
+    quint8 readUInt8(quint8 commandClass, quint8 attribute);
     void writeAttribute(quint8 commandClass, quint8 attribute, const QByteArray &data);
     std::unique_ptr<SerialTransport> m_ownedTransport;
     SerialTransport *m_transport{nullptr};

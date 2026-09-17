@@ -16,7 +16,10 @@ bool sameGas(QString actual, QString configured)
         value = value.trimmed().toLower();
         if (value == QStringLiteral("空气") || value == QStringLiteral("air")) return QStringLiteral("air");
         if (value == QStringLiteral("氮气") || value == QStringLiteral("n2") || value == QStringLiteral("nitrogen")) return QStringLiteral("n2");
-        if (value == QStringLiteral("丙烷") || value == QStringLiteral("propane")) return QStringLiteral("propane");
+        // Devices may return the gas formula while the field configuration
+        // uses its Chinese/common name.  Both denote propane.
+        if (value == QStringLiteral("丙烷") || value == QStringLiteral("propane")
+            || value == QStringLiteral("c3h8")) return QStringLiteral("propane");
         return value;
     };
     actual = canonical(actual); configured = canonical(configured);
@@ -27,7 +30,14 @@ QString metadataFailureStatus(const QString &error, const QVariantMap &transacti
 {
     const QString result = transaction.value("result").toString();
     const QString text = error.toLower();
+    if (result == QStringLiteral("CANCELLED")) return QStringLiteral("CANCELLED");
     if (text.contains(QStringLiteral("empty_payload"))) return QStringLiteral("UNSUPPORTED_OR_EMPTY_RESPONSE");
+    // SerialTransport already accepted a complete, checksum-valid frame.  A
+    // decoder failure after that point must not be reported as a timeout or a
+    // generic RS485 failure (notably useful for model-specific numeric data).
+    if (result == QStringLiteral("SUCCESS")
+        && (text.contains(QStringLiteral("payload")) || text.contains(QStringLiteral("uint"))))
+        return QStringLiteral("PARSER_FAILURE");
     if (result == QStringLiteral("TIMEOUT") || text.contains(QStringLiteral("timeout"))) return QStringLiteral("TIMEOUT");
     if (text.contains(QStringLiteral("nak"))) return QStringLiteral("NAK");
     if (text.contains(QStringLiteral("checksum"))) return QStringLiteral("CHECKSUM_ERROR");
@@ -43,10 +53,12 @@ QString metadataStatusText(const QString &status)
     if (status == QStringLiteral("MISMATCH")) return QStringLiteral("配置不一致");
     if (status == QStringLiteral("READ_OK")) return QStringLiteral("读取成功");
     if (status == QStringLiteral("UNSUPPORTED_OR_EMPTY_RESPONSE")) return QStringLiteral("设备未返回数据");
+    if (status == QStringLiteral("PARSER_FAILURE")) return QStringLiteral("响应已收到但数据解析失败");
     if (status == QStringLiteral("TIMEOUT")) return QStringLiteral("读取超时");
     if (status == QStringLiteral("NAK")) return QStringLiteral("设备拒绝请求（NAK）");
     if (status == QStringLiteral("CHECKSUM_ERROR")) return QStringLiteral("校验和错误");
     if (status == QStringLiteral("UNEXPECTED_RESPONSE")) return QStringLiteral("响应命令不匹配");
+    if (status == QStringLiteral("CANCELLED")) return QStringLiteral("读取已取消");
     return QStringLiteral("读取失败");
 }
 
@@ -125,14 +137,20 @@ QStringList MfcManager::readAndReportMetadata(MfcDeviceState &state, CS200ADrive
         // Device ownership is intentionally the address captured in the one
         // pending request, all the way to this state object.  CS200 response
         // address (normally 0x00) is logged as evidence but never consulted.
+        const bool created = transaction.value("transactionCreated", true).toBool();
+        const QString requestAddress = created ? QString::number(transaction.value("address").toInt())
+                                               : QStringLiteral("NONE");
+        const QString responseAddress = created && transaction.value("responseAddress").toInt() >= 0
+            ? QStringLiteral("0x%1").arg(transaction.value("responseAddress").toInt(), 2, 16, QLatin1Char('0'))
+            : QStringLiteral("NONE");
         m_trace(QStringLiteral("[META][%1][%2] timestamp=%3 REQUEST_ADDRESS=%4 PENDING_ADDRESS=%5 "
-                               "STATE_DESTINATION_ADDRESS=%6 RESPONSE_ADDRESS=0x%7 TX=%8 ACK=%9 RX=%10 "
+                               "STATE_DESTINATION_ADDRESS=%6 RESPONSE_ADDRESS=%7 TX=%8 ACK=%9 RX=%10 "
                                "RX_TOTAL_LENGTH=%11 RX_DATA_LENGTH=%12 CLASS=0x%13 INSTANCE=0x%14 "
                                "ATTRIBUTE=0x%15 PAYLOAD=%16 PARSED_VALUE=%17 CHECKSUM=%18 "
                                "beforeTxRxBufferSize=%19 afterResponseRxBufferSize=%20 PARSE_RESULT=%21")
             .arg(address).arg(name, QDateTime::currentDateTime().toString(Qt::ISODateWithMs))
-            .arg(transaction.value("address").toInt()).arg(transaction.value("address").toInt()).arg(address)
-            .arg(transaction.value("responseAddress").toInt(), 2, 16, QLatin1Char('0'))
+            .arg(requestAddress, requestAddress).arg(address)
+            .arg(responseAddress)
             .arg(transaction.value("txRaw").toString(), transaction.value("ackRaw").toString(),
                  transaction.value("rxRaw").toString())
             .arg(transaction.value("rxTotalLength").toInt()).arg(transaction.value("responseDataLength").toInt())
@@ -155,11 +173,17 @@ QStringList MfcManager::readAndReportMetadata(MfcDeviceState &state, CS200ADrive
         // FinishGuard cleared its single pending request.
         if (!m_transport.transactionPending()) QThread::msleep(m_settings.metadataInterRequestDelayMs);
     };
-    const auto read = [&](const QString &name, const QString &expected, auto reader, auto store,
+    const auto read = [&](const QString &name, const QString &operation, const QString &expected, auto reader, auto store,
                           auto matches) {
+        if (m_trace) m_trace(QStringLiteral("[DeviceInfo] REQUEST_BEGIN address=%1 logical_channel=%2 operation=%3 pending=%4")
+            .arg(address).arg(state.config.logicalChannel).arg(operation)
+            .arg(m_transport.transactionPending()));
         try {
             const auto value = reader();
             store(value);
+            if (m_transport.diagnostics().value("lastTransaction").toMap()
+                    .value("retrySuccess").toBool())
+                ++m_lastDeviceInfoRetryRecoveredCount;
             const QString reported = QVariant::fromValue(value).toString();
             const bool comparison = expected.isEmpty() || matches(value);
             const QString status = expected.isEmpty() ? QStringLiteral("READ_OK")
@@ -167,6 +191,9 @@ QStringList MfcManager::readAndReportMetadata(MfcDeviceState &state, CS200ADrive
             state.metadataResults.insert(name, makeMetadataResult(status, expected, reported));
             if (status == QStringLiteral("MISMATCH")) mismatches.append(name);
             recordEvidence(name, status, reported, m_transport.diagnostics().value("lastTransaction").toMap());
+            if (m_trace) m_trace(QStringLiteral("[DeviceInfo] REQUEST_END address=%1 logical_channel=%2 operation=%3 result=%4 request_id=%5")
+                .arg(address).arg(state.config.logicalChannel).arg(operation, status)
+                .arg(m_transport.diagnostics().value("lastTransaction").toMap().value("requestId").toULongLong()));
         } catch (const std::exception &error) {
             const QString detail = QString::fromUtf8(error.what());
             const QVariantMap transaction = m_transport.diagnostics().value("lastTransaction").toMap();
@@ -174,35 +201,41 @@ QStringList MfcManager::readAndReportMetadata(MfcDeviceState &state, CS200ADrive
             state.metadataResults.insert(name, makeMetadataResult(status, expected, QStringLiteral("--"), detail));
             failures.append(name + QStringLiteral("（") + metadataStatusText(status) + QStringLiteral("）"));
             recordEvidence(name, status + QStringLiteral(": ") + detail, QStringLiteral("--"), transaction);
+            if (m_trace) m_trace(QStringLiteral("[DeviceInfo] REQUEST_END address=%1 logical_channel=%2 operation=%3 result=%4 request_id=%5 error=%6")
+                .arg(address).arg(state.config.logicalChannel).arg(operation, status)
+                .arg(transaction.value("requestId").toULongLong()).arg(detail));
         }
         pauseAfterComplete();
     };
 
-    read(QStringLiteral("Model"), {}, [&] { return driver.readModelIdentifier(); },
+    read(QStringLiteral("Model"), QStringLiteral("READ_MODEL"), {}, [&] { return driver.readModelIdentifier(); },
          [&](const QString &v) { state.info.model = v; }, [](const auto &) { return true; });
-    read(QStringLiteral("Serial"), {}, [&] { return driver.readSerialNumber(); },
+    read(QStringLiteral("Serial"), QStringLiteral("READ_SERIAL"), {}, [&] { return driver.readSerialNumber(); },
          [&](const QString &v) { state.info.serialNumber = v; }, [](const auto &) { return true; });
-    read(QStringLiteral("Target Gas Name"), state.config.gasType, [&] { return driver.readTargetGasName(); },
+    read(QStringLiteral("Target Gas Name"), QStringLiteral("READ_GAS_NAME"), state.config.gasType, [&] { return driver.readTargetGasName(); },
          [&](const QString &v) { state.info.targetGasName = v; }, [&](const QString &v) { return sameGas(v, state.config.gasType); });
-    read(QStringLiteral("Target Gas Code"), QString::number(state.config.expectedGasCode), [&] { return driver.readTargetGasCode(); },
+    read(QStringLiteral("Target Gas Code"), QStringLiteral("READ_GAS_CODE"), QString::number(state.config.expectedGasCode), [&] { return driver.readTargetGasCode(); },
          [&](quint16 v) { state.info.targetGasCode = v; }, [&](quint16 v) { return v == state.config.expectedGasCode; });
-    read(QStringLiteral("Target Full Scale"), QString::number(state.config.expectedDeviceFullScaleSccm), [&] { return driver.readTargetGasFullScale(); },
+    read(QStringLiteral("Target Full Scale"), QStringLiteral("READ_FULL_SCALE"), QString::number(state.config.expectedDeviceFullScaleSccm), [&] { return driver.readTargetGasFullScale(); },
          [&](quint16 v) { state.info.targetGasFullScale = v; state.info.fullScale = v; state.info.fullScaleUnit = QStringLiteral("sccm"); state.info.fullScaleReadFromDevice = true; },
          [&](quint16 v) { return std::abs(static_cast<double>(v) - state.config.expectedDeviceFullScaleSccm) <= 0.5; });
     if (includeCalibration) {
-        read(QStringLiteral("Calibration Gas Code"), {}, [&] { return driver.readCalibrationGasCode(); },
+        read(QStringLiteral("Calibration Gas Code"), QStringLiteral("READ_CALIBRATION_GAS_CODE"), {}, [&] { return driver.readCalibrationGasCode(); },
              [&](quint16 v) { state.info.calibrationGasCode = v; }, [](const auto &) { return true; });
-        read(QStringLiteral("Calibration Full Scale"), {}, [&] { return driver.readCalibrationGasFullScale(); },
+        read(QStringLiteral("Calibration Full Scale"), QStringLiteral("READ_CALIBRATION_FULL_SCALE"), {}, [&] { return driver.readCalibrationGasFullScale(); },
              [&](quint16 v) { state.info.calibrationGasFullScale = v; state.info.calibrationGasReadFromDevice = true; },
              [](const auto &) { return true; });
-        read(QStringLiteral("Calibration Gas Name"), {}, [&] { return driver.readCalibrationGasName(); },
+        read(QStringLiteral("Calibration Gas Name"), QStringLiteral("READ_CALIBRATION_GAS_NAME"), {}, [&] { return driver.readCalibrationGasName(); },
              [&](const QString &v) { state.info.calibrationGasName = v; }, [](const auto &) { return true; });
     }
-    read(QStringLiteral("Conversion Factor"), {}, [&] { return driver.readConversionFactor(); },
+    read(QStringLiteral("Conversion Factor"), QStringLiteral("READ_CONVERSION_FACTOR"), {}, [&] { return driver.readConversionFactor(); },
          [&](double v) { state.info.conversionFactor = v; }, [](const auto &) { return true; });
-    read(QStringLiteral("RS485 Address"), QString::number(state.config.address), [&] { return driver.readRs485MacAddress(); },
-         [&](quint16 v) { state.info.address = static_cast<quint8>(v); }, [&](quint16 v) { return v == state.config.address; });
-    read(QStringLiteral("Baud"), {}, [&] { return driver.readBaudRate(); },
+    // Protocol V2.3 5.12 defines 0x03/0x01 (RS485 MAC Address) as UINT8.
+    // It is the authoritative address proof: normal CS200 read responses use
+    // source 0x00 and therefore cannot identify the addressed device.
+    read(QStringLiteral("RS485 Address"), QStringLiteral("READ_RS485_ADDRESS"), QString::number(state.config.address), [&] { return driver.readRs485MacAddress(); },
+         [&](quint8 v) { state.info.address = v; }, [&](quint8 v) { return v == state.config.address; });
+    read(QStringLiteral("Baud"), QStringLiteral("READ_BAUD"), {}, [&] { return driver.readBaudRate(); },
          [&](quint16 v) { state.info.baudRate = v; }, [](const auto &) { return true; });
 
     const bool allRead = failures.isEmpty();
@@ -224,6 +257,13 @@ QStringList MfcManager::readAndReportMetadata(MfcDeviceState &state, CS200ADrive
 bool MfcManager::validateControlPreflight(const QMap<int, double> &targets, QString *errorMessage)
 {
     if (!isConnected()) { if (errorMessage) *errorMessage = QStringLiteral("控制预检失败：串口未连接"); return false; }
+    m_transport.setTransactionOrigin(QStringLiteral("CONTROL_PREFLIGHT"));
+    struct OriginReset { SerialTransport &transport; ~OriginReset() { transport.setTransactionOrigin({}); } } originReset{m_transport};
+    if (m_verificationSnapshot.valid && !hasValidVerificationSnapshot())
+        invalidateVerificationSnapshot(QStringLiteral("connection_or_configuration_changed"));
+    const bool reuseSnapshot = hasValidVerificationSnapshot();
+    m_lastDeviceInfoFailedCount = 0;
+    m_lastDeviceInfoRetryRecoveredCount = 0;
     QStringList failures;
     for (auto &state : m_devices) {
         if (!state.config.enabled) continue;
@@ -239,9 +279,12 @@ bool MfcManager::validateControlPreflight(const QMap<int, double> &targets, QStr
             continue;
         }
         try {
+            if (reuseSnapshot) continue;
+            clearDeviceInfoState(state);
             m_transport.setLogicalChannel(state.config.logicalChannel);
             CS200ADriver driver(m_transport, state.config.address, m_trace);
-            driver.setTransactionOptions(m_settings.ackTimeoutMs, m_settings.responseTimeoutMs, 0);
+            driver.setTransactionOptions(m_settings.ackTimeoutMs, m_settings.responseTimeoutMs,
+                                         deviceInfoMaxRetries());
             const QStringList mismatches = readAndReportMetadata(state, driver);
             if (!state.metadataVerificationComplete)
                 failures.append(QStringLiteral("%1（设备信息无法完成核验：%2）")
@@ -255,9 +298,16 @@ bool MfcManager::validateControlPreflight(const QMap<int, double> &targets, QStr
         }
     }
     if (!failures.isEmpty()) {
+        m_lastDeviceInfoFailedCount = failures.size();
         if (errorMessage) *errorMessage = QStringLiteral("控制预检失败（未发送任何控制写命令）：")
             + failures.join(QStringLiteral("；"));
         return false;
+    }
+    if (!reuseSnapshot) saveVerificationSnapshot();
+    else if (m_trace) {
+        const qint64 age = m_verificationSnapshot.verifiedAt.msecsTo(QDateTime::currentDateTime());
+        m_trace(QStringLiteral("[CONTROL] PREFLIGHT_DEVICEINFO_REUSE snapshot_age_ms=%1 connection_generation=%2 config_revision=%3")
+            .arg(age).arg(m_connectionGeneration).arg(m_verificationSnapshot.configurationRevision));
     }
     return true;
 }
@@ -308,14 +358,21 @@ bool MfcManager::verifyDeviceInformation(QString *errorMessage)
         if (errorMessage) *errorMessage = QStringLiteral("设备信息核验失败：串口未连接");
         return false;
     }
+    m_transport.setTransactionOrigin(QStringLiteral("MANUAL_VERIFY"));
+    struct OriginReset { SerialTransport &transport; ~OriginReset() { transport.setTransactionOrigin({}); } } originReset{m_transport};
+    m_lastDeviceInfoFailedCount = 0;
+    m_lastDeviceInfoRetryRecoveredCount = 0;
     QStringList failures;
     for (auto &state : m_devices) {
         if (!state.config.enabled) continue;
+        clearDeviceInfoState(state);
+        if (m_trace) m_trace(QStringLiteral("[Startup] DEVICE_INFO_BEGIN addr=%1 logical_channel=%2")
+            .arg(state.config.address).arg(state.config.logicalChannel));
         try {
             m_transport.setLogicalChannel(state.config.logicalChannel);
             CS200ADriver driver(m_transport, state.config.address, m_trace);
             driver.setTransactionOptions(m_settings.ackTimeoutMs, m_settings.responseTimeoutMs,
-                                         m_settings.retryCount);
+                                         deviceInfoMaxRetries());
             // Calibration attributes are a diagnosis-only read.  Preflight
             // keeps its established Target/identity checks and lock behavior.
             (void)readAndReportMetadata(state, driver, true);
@@ -325,11 +382,17 @@ bool MfcManager::verifyDeviceInformation(QString *errorMessage)
             state.metadataAvailable = false;
             failures.append(QStringLiteral("%1：%2").arg(state.config.displayName, QString::fromUtf8(e.what())));
         }
+        if (m_trace) m_trace(QStringLiteral("[Startup] DEVICE_INFO_END addr=%1 complete=%2 error=%3")
+            .arg(state.config.address).arg(state.metadataVerificationComplete).arg(state.lastError));
     }
+    if (m_trace) m_trace(QStringLiteral("[Startup] DEVICE_INFO_ALL_COMPLETE result=%1 failed_count=%2")
+        .arg(failures.isEmpty() ? QStringLiteral("SUCCESS") : QStringLiteral("FAILED")).arg(failures.size()));
     if (!failures.isEmpty()) {
+        m_lastDeviceInfoFailedCount = failures.size();
         if (errorMessage) *errorMessage = QStringLiteral("设备信息无法完成核验：") + failures.join(QStringLiteral("；"));
         return false;
     }
+    saveVerificationSnapshot();
     return true;
 }
 
@@ -501,6 +564,74 @@ MfcManager::MfcManager(QList<MfcDeviceConfig> devices, Settings settings,
     }
 }
 
+QString MfcManager::deviceConfigurationRevision() const
+{
+    QStringList parts;
+    for (const auto &state : m_devices) {
+        const auto &c = state.config;
+        parts.append(QStringLiteral("%1:%2:%3:%4:%5:%6:%7")
+            .arg(c.enabled).arg(c.address).arg(c.logicalChannel).arg(c.addressConfirmed)
+            .arg(c.expectedGasCode).arg(c.expectedDeviceFullScaleSccm, 0, 'g', 16)
+            .arg(c.gasType));
+    }
+    return parts.join('|');
+}
+
+void MfcManager::invalidateVerificationSnapshot(const QString &reason)
+{
+    if (m_verificationSnapshot.valid && m_trace)
+        m_trace(QStringLiteral("[CONTROL] PREFLIGHT_DEVICEINFO_SNAPSHOT_INVALID reason=%1").arg(reason));
+    m_verificationSnapshot = {};
+}
+
+void MfcManager::clearDeviceInfoState(MfcDeviceState &state)
+{
+    state.metadataVerificationAttempted = true;
+    state.metadataVerificationComplete = false;
+    state.metadataAvailable = false;
+    state.metadataResults.clear();
+    state.lastError.clear();
+}
+
+void MfcManager::saveVerificationSnapshot()
+{
+    VerificationSnapshot snapshot;
+    snapshot.valid = true;
+    snapshot.connectionGeneration = m_connectionGeneration;
+    snapshot.portIdentity = m_transport.portName();
+    snapshot.configurationRevision = deviceConfigurationRevision();
+    snapshot.verifiedAt = QDateTime::currentDateTime();
+    for (const auto &state : m_devices) {
+        if (!state.config.enabled) continue;
+        snapshot.enabledAddresses.append(state.config.address);
+        snapshot.identities.insert(state.config.address, QStringLiteral("%1|%2|%3|%4|%5")
+            .arg(state.info.model, state.info.serialNumber, state.info.targetGasName)
+            .arg(state.info.targetGasCode).arg(state.info.targetGasFullScale));
+    }
+    if (m_verificationSnapshot.valid && m_verificationSnapshot.identities != snapshot.identities)
+        invalidateVerificationSnapshot(QStringLiteral("verified_identity_changed"));
+    m_verificationSnapshot = std::move(snapshot);
+}
+
+bool MfcManager::hasValidVerificationSnapshot() const
+{
+    const auto &snapshot = m_verificationSnapshot;
+    if (!snapshot.valid || !isConnected() || snapshot.connectionGeneration != m_connectionGeneration
+        || snapshot.portIdentity != m_transport.portName()
+        || snapshot.configurationRevision != deviceConfigurationRevision()) return false;
+    QList<quint8> enabled;
+    for (const auto &state : m_devices) {
+        if (!state.config.enabled || !state.communicationOnline) {
+            if (state.config.enabled) return false;
+            continue;
+        }
+        enabled.append(state.config.address);
+    }
+    if (enabled != snapshot.enabledAddresses) return false;
+    return snapshot.verifiedAt.msecsTo(QDateTime::currentDateTime())
+        <= qMax(1000, m_settings.verificationSnapshotMaxAgeMs);
+}
+
 int MfcManager::onlineCount() const
 {
     return static_cast<int>(std::count_if(m_devices.cbegin(), m_devices.cend(),
@@ -544,8 +675,13 @@ QString MfcManager::communicationNotice() const
 
 void MfcManager::setMonitoringActive(bool active)
 {
-    if (active) m_transport.clearCancellation();
-    else m_transport.requestCancel();
+    if (active) {
+        m_transport.clearCancellation();
+        if (m_trace) m_trace(QStringLiteral("[transport] CANCELLATION_CLEARED context=MONITORING_START"));
+    } else {
+        m_transport.requestCancel(SerialTransport::CancelReason::MonitoringStop);
+        if (m_trace) m_trace(QStringLiteral("[transport] CANCELLATION_REQUESTED reason=MONITORING_STOP context=MONITORING_STOP"));
+    }
     for (auto &state : m_devices) state.monitoringActive = active;
 }
 
@@ -599,6 +735,7 @@ bool MfcManager::setAddressConfirmed(int address, bool confirmed)
         if (state.config.address != address) continue;
         state.config.addressConfirmed = confirmed;
         state.refreshCapabilities();
+        invalidateVerificationSnapshot(QStringLiteral("configuration_revision_changed"));
         return true;
     }
     return false;
@@ -661,13 +798,17 @@ bool MfcManager::connectBus()
     for (const auto &port : ports) {
         for (const auto baud : baudRates) {
             try {
+                if (m_trace) m_trace(QStringLiteral("[Startup] SERIAL_OPEN_BEGIN port=%1 baud=%2").arg(port.device).arg(baud));
                 m_transport.open(port.device, baud);
+                if (m_trace) m_trace(QStringLiteral("[Startup] SERIAL_OPEN_OK port=%1 baud=%2").arg(port.device).arg(baud));
                 if (!haveOpenablePort) {
                     fallbackPort = port;
                     haveOpenablePort = true;
                 }
                 if (probeCurrentPort()) {
                     m_connectedBaud = baud;
+                    ++m_connectionGeneration;
+                    invalidateVerificationSnapshot(QStringLiteral("serial_reconnect"));
                     // Initial connection only probes READ_FLOW.  Identity is
                     // read later, after an explicit Start Control request.
                     for (auto &state : m_devices) {
@@ -692,7 +833,7 @@ bool MfcManager::connectBus()
                     return true;
                 }
             } catch (const std::exception &error) {
-                if (m_trace) m_trace(QStringLiteral("OPEN/PROBE ERROR port=%1 baud=%2 %3")
+                if (m_trace) m_trace(QStringLiteral("[Startup] SERIAL_OPEN_FAILED port=%1 baud=%2 error=%3")
                                      .arg(port.device).arg(baud).arg(QString::fromUtf8(error.what())));
             }
             m_transport.close();
@@ -702,8 +843,14 @@ bool MfcManager::connectBus()
     // did not answer.  The service will periodically reprobe this openable port.
     if (haveOpenablePort) {
         try {
+            if (m_trace) m_trace(QStringLiteral("[Startup] SERIAL_OPEN_BEGIN port=%1 baud=%2 fallback=true")
+                                 .arg(fallbackPort.device).arg(m_settings.baudRate));
             m_transport.open(fallbackPort.device, m_settings.baudRate);
             m_connectedBaud = m_settings.baudRate;
+            ++m_connectionGeneration;
+            invalidateVerificationSnapshot(QStringLiteral("serial_reconnect"));
+            if (m_trace) m_trace(QStringLiteral("[Startup] SERIAL_OPEN_OK port=%1 baud=%2 fallback=true")
+                                 .arg(fallbackPort.device).arg(m_settings.baudRate));
             return true;
         } catch (const std::exception &) {}
     }
@@ -722,6 +869,8 @@ bool MfcManager::connectBusForExperiment()
         try {
             m_transport.open(port.device, m_settings.baudRate);
             m_connectedBaud = m_settings.baudRate;
+            ++m_connectionGeneration;
+            invalidateVerificationSnapshot(QStringLiteral("serial_reconnect"));
             if (m_trace) m_trace(QStringLiteral("EXPERIMENT_SERIAL_OPEN port=%1 baud=%2 no_probe=true")
                                  .arg(port.device).arg(m_connectedBaud));
             return true;
@@ -735,7 +884,11 @@ bool MfcManager::connectBusForExperiment()
 
 void MfcManager::disconnectBus()
 {
+    if (m_trace && m_transport.isOpen())
+        m_trace(QStringLiteral("[transport] DISCONNECT_BUS_BEGIN port=%1 pending=%2")
+            .arg(m_transport.portName()).arg(m_transport.transactionPending()));
     m_transport.close();
+    invalidateVerificationSnapshot(QStringLiteral("serial_disconnect"));
     m_connectedBaud = 0;
     for (auto &state : m_devices) {
         state.linkState = MfcLinkState::Offline;
@@ -778,6 +931,8 @@ void MfcManager::recordFailure(MfcDeviceState &state, const std::exception &erro
     state.reading.communicationOk = false;
     if (state.communicationState == MfcCommunicationState::Fault)
         state.communicationOnline = false;
+    if (state.communicationState == MfcCommunicationState::Fault)
+        invalidateVerificationSnapshot(QStringLiteral("mfc_offline"));
     if (dynamic_cast<const SerialTransport::Timeout *>(&error)) {
         ++state.timeoutCount;
         state.linkState = state.communicationState == MfcCommunicationState::Fault
@@ -820,6 +975,8 @@ bool MfcManager::pollDevice(int index, QString *errorMessage)
     QElapsedTimer elapsed;
     elapsed.start();
     try {
+        if (m_trace) m_trace(QStringLiteral("[Polling] READ_FLOW_BEGIN address=%1 logical_channel=%2 pending=%3")
+            .arg(state.config.address).arg(state.config.logicalChannel).arg(m_transport.transactionPending()));
         m_transport.setLogicalChannel(state.config.logicalChannel);
         CS200ADriver driver(m_transport, state.config.address, m_trace);
         driver.setTransactionOptions(m_settings.ackTimeoutMs, m_settings.responseTimeoutMs,

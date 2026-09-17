@@ -40,16 +40,29 @@ MonitoringController::MonitoringController(int interval, double warning, double 
     connect(qobject_cast<CS200ADeviceService *>(m_service),
             &CS200ADeviceService::fullScaleDiagnosticsFinished,
             this, &MonitoringController::fullScaleDiagnosticsFinished);
+    connect(qobject_cast<CS200ADeviceService *>(m_service),
+            &CS200ADeviceService::readFlowSucceeded,
+            this, &MonitoringController::onReadFlowSucceeded);
+    connect(qobject_cast<CS200ADeviceService *>(m_service),
+            &CS200ADeviceService::deviceInfoScanFinished,
+            this, &MonitoringController::onDeviceInfoScanFinished);
     m_deviceThread.setObjectName(QStringLiteral("CS200-A 串口工作线程"));
         m_communicationWatchdog.setInterval(500);
         m_communicationWatchdog.setTimerType(Qt::CoarseTimer);
         connect(&m_communicationWatchdog, &QTimer::timeout, this, [this] {
             const bool experimentActive = m_deviceInfo.value("experiment").toMap().value("active").toBool();
-            if ((!m_monitoring && !experimentActive) || !m_lastCommunicationProgress.isValid()
-                || m_lastCommunicationProgress.elapsed() < 2000) return;
             auto *service = qobject_cast<CS200ADeviceService *>(m_service);
+            if (service && service->monitoringWatchdogSuspended()) {
+                m_monitoringWatchdogArmed = false;
+                m_waitingForPostDeviceInfoReadFlow = true;
+                m_communicationWatchdog.stop();
+                m_lastCommunicationProgress.invalidate();
+                return;
+            }
+            if ((!m_monitoringWatchdogArmed && !experimentActive) || !m_lastCommunicationProgress.isValid()
+                || m_lastCommunicationProgress.elapsed() < 2000) return;
             if (!service) return;
-            service->requestTransactionCancellation();
+            service->requestTransactionCancellation(SerialTransport::CancelReason::WorkerWatchdog);
             if (experimentActive)
                 QMetaObject::invokeMethod(service, &CS200ADeviceService::recordExperimentWatchdogTrigger,
                                           Qt::QueuedConnection);
@@ -80,7 +93,7 @@ MonitoringController::~MonitoringController()
 {
     if (m_deviceThread.isRunning()) {
         if (auto *service = qobject_cast<CS200ADeviceService *>(m_service))
-            service->requestTransactionCancellation();
+            service->requestTransactionCancellation(SerialTransport::CancelReason::ApplicationShutdown);
         QMetaObject::invokeMethod(m_service, &IDeviceService::stopMonitoring, Qt::BlockingQueuedConnection);
         QMetaObject::invokeMethod(m_service, &IDeviceService::disconnectDevice, Qt::BlockingQueuedConnection);
         m_deviceThread.quit();
@@ -126,8 +139,13 @@ void MonitoringController::startMonitoring()
 void MonitoringController::stopMonitoring()
 {
     if (m_monitoring) { m_monitoring = false; emit monitoringChanged(); }
+    // The service's false signal can be a duplicate after the optimistic UI
+    // state update above, so disarm synchronously here as well.
+    m_monitoringWatchdogArmed = false;
+    m_communicationWatchdog.stop();
+    m_lastCommunicationProgress.invalidate();
     if (auto *service = qobject_cast<CS200ADeviceService *>(m_service))
-        service->requestTransactionCancellation();
+        service->requestTransactionCancellation(SerialTransport::CancelReason::MonitoringStop);
     QMetaObject::invokeMethod(m_service, &IDeviceService::stopMonitoring, Qt::QueuedConnection);
 }
 
@@ -185,6 +203,7 @@ void MonitoringController::stopCommunicationExperiment()
 void MonitoringController::startControl(const OperatingPoint &point)
 {
     if (!point.hasValidFlowValues()) { emit errorOccurred(QStringLiteral("运行点目标流量数据无效")); return; }
+    disarmMonitoringWatchdogForDeviceInfo();
     QMetaObject::invokeMethod(m_service, [service=m_service, point] {
         if (auto *cs = qobject_cast<CS200ADeviceService *>(service)) cs->startControl(point);
     }, Qt::QueuedConnection);
@@ -199,6 +218,7 @@ void MonitoringController::stopControl()
 
 void MonitoringController::verifyDeviceInformation()
 {
+    disarmMonitoringWatchdogForDeviceInfo();
     QMetaObject::invokeMethod(m_service, [service=m_service] {
         if (auto *cs = qobject_cast<CS200ADeviceService *>(service)) cs->verifyDeviceInformation();
     }, Qt::QueuedConnection);
@@ -206,6 +226,7 @@ void MonitoringController::verifyDeviceInformation()
 
 void MonitoringController::runFullScaleDiagnostics()
 {
+    disarmMonitoringWatchdogForDeviceInfo();
     QMetaObject::invokeMethod(m_service, [service=m_service] {
         if (auto *cs = qobject_cast<CS200ADeviceService *>(service)) cs->runFullScaleDiagnostics();
     }, Qt::QueuedConnection);
@@ -220,6 +241,43 @@ void MonitoringController::onFlows(const QList<GasChannel> &channels)
     emit flowSampleReceived(channels);
 }
 
+void MonitoringController::onReadFlowSucceeded()
+{
+    auto *service = qobject_cast<CS200ADeviceService *>(m_service);
+    const bool suspended = service && service->monitoringWatchdogSuspended();
+    if (!shouldArmMonitoringWatchdog(m_monitoring, suspended, true)) return;
+    m_waitingForPostDeviceInfoReadFlow = false;
+    if (!m_monitoringWatchdogArmed) {
+        m_monitoringWatchdogArmed = true;
+        m_lastCommunicationProgress.start();
+        m_communicationWatchdog.start();
+    } else {
+        // READ_FLOW success—not a metadata request—is normal polling
+        // progress, so it alone advances the watchdog baseline.
+        m_lastCommunicationProgress.restart();
+    }
+}
+
+void MonitoringController::onDeviceInfoScanFinished()
+{
+    // A long legal scan invalidates the old READ_FLOW baseline.  The first
+    // new successful poll is the sole event that can arm the timer again.
+    m_monitoringWatchdogArmed = false;
+    m_waitingForPostDeviceInfoReadFlow = m_monitoring;
+    m_communicationWatchdog.stop();
+    m_lastCommunicationProgress.invalidate();
+}
+
+void MonitoringController::disarmMonitoringWatchdogForDeviceInfo()
+{
+    if (auto *service = qobject_cast<CS200ADeviceService *>(m_service))
+        service->reserveDeviceInfoScan();
+    m_monitoringWatchdogArmed = false;
+    m_waitingForPostDeviceInfoReadFlow = true;
+    m_communicationWatchdog.stop();
+    m_lastCommunicationProgress.invalidate();
+}
+
 void MonitoringController::onDeviceStatus(DeviceStatus status)
 {
     if (m_deviceStatus == status) return;
@@ -229,13 +287,25 @@ void MonitoringController::onDeviceStatus(DeviceStatus status)
 
 void MonitoringController::onMonitoringActive(bool active)
 {
-    if (m_monitoring == active) return;
+    if (m_monitoring == active) {
+        if (!active) {
+            m_monitoringWatchdogArmed = false;
+            m_waitingForPostDeviceInfoReadFlow = false;
+            m_communicationWatchdog.stop();
+            m_lastCommunicationProgress.invalidate();
+        }
+        return;
+    }
     m_monitoring = active;
     if (active) {
         m_lastFinishedRequestId = m_deviceInfo.value("transaction_lastFinishedRequestId").toULongLong();
-        m_lastCommunicationProgress.start();
-        if (m_communicationWatchdog.interval() > 0) m_communicationWatchdog.start();
+        // The timer is armed by onFlows() after the first polling result,
+        // never while startup DeviceInfo is still issuing metadata requests.
+        m_monitoringWatchdogArmed = false;
+        m_waitingForPostDeviceInfoReadFlow = false;
     } else {
+        m_monitoringWatchdogArmed = false;
+        m_waitingForPostDeviceInfoReadFlow = false;
         m_communicationWatchdog.stop();
         m_lastCommunicationProgress.invalidate();
     }
@@ -258,7 +328,9 @@ void MonitoringController::onDeviceInfo(const QVariantMap &info)
     const quint64 finished = info.value("transaction_lastFinishedRequestId").toULongLong();
     if (finished != 0 && finished != m_lastFinishedRequestId) {
         m_lastFinishedRequestId = finished;
-        if (m_monitoring || experimentActive) m_lastCommunicationProgress.restart();
+        // Experiment diagnostics retain their independent transaction
+        // heartbeat. Normal polling only progresses on READ_FLOW success.
+        if (experimentActive) m_lastCommunicationProgress.restart();
     }
     if (experimentActive && !wasExperimentActive) {
         m_lastCommunicationProgress.start();

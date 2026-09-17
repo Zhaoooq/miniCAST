@@ -39,6 +39,12 @@ QString errorType(const QString &detail, const QString &result = QString())
     if (result == QStringLiteral("SERIAL_ERROR")) return QStringLiteral("serial_error");
     return QStringLiteral("other_protocol_error");
 }
+QString commandName(quint8 service)
+{
+    if (service == MfcProtocol::ReadService) return QStringLiteral("READ");
+    if (service == MfcProtocol::WriteService) return QStringLiteral("WRITE");
+    return QStringLiteral("UNKNOWN");
+}
 }
 
 SerialTransport::SerialTransport(TraceSink trace) : m_trace(std::move(trace))
@@ -46,6 +52,63 @@ SerialTransport::SerialTransport(TraceSink trace) : m_trace(std::move(trace))
     m_monotonicClock.start();
 }
 SerialTransport::~SerialTransport() { close(); }
+
+QString SerialTransport::cancelReasonName(CancelReason reason)
+{
+    switch (reason) {
+    case CancelReason::MonitoringStop: return QStringLiteral("MONITORING_STOP");
+    case CancelReason::DeviceDisconnect: return QStringLiteral("DEVICE_DISCONNECT");
+    case CancelReason::ApplicationShutdown: return QStringLiteral("APPLICATION_SHUTDOWN");
+    case CancelReason::ExperimentStop: return QStringLiteral("EXPERIMENT_STOP");
+    case CancelReason::WorkerWatchdog: return QStringLiteral("WORKER_WATCHDOG");
+    case CancelReason::Unspecified: return QStringLiteral("UNSPECIFIED");
+    }
+    return QStringLiteral("UNSPECIFIED");
+}
+
+void SerialTransport::recordPreCreateCancellation(const char *context)
+{
+    // No PendingRequest exists in this path.  Replace rather than augment
+    // the previous snapshot so a metadata/UI consumer cannot mistake the
+    // preceding successful transaction's bytes for this cancelled one.
+    const QDateTime timestamp = QDateTime::currentDateTime();
+    const auto reason = static_cast<CancelReason>(m_cancelReason.load());
+    m_lastTransaction = {
+        {"requestId", static_cast<qulonglong>(0)}, {"transactionCreated", false},
+        {"result", QStringLiteral("CANCELLED")}, {"detail", QStringLiteral("transaction cancelled")},
+        {"cancellationReason", cancelReasonName(reason)},
+        {"cancellationContext", QString::fromLatin1(context)},
+        {"txRaw", QString()}, {"ackRaw", QString()}, {"rxRaw", QString()},
+        {"responseFrameRaw", QString()}, {"payloadRaw", QString()},
+        {"responseAddress", -1}, {"responseDataLength", -1}, {"rxTotalLength", 0},
+        {"checksumValid", false}, {"attemptCount", 0}, {"retryCount", 0},
+        {"transactionState", stateName(m_state)},
+        {"finishTimestamp", timestamp.toString(Qt::ISODateWithMs)},
+        {"serialConfiguration", runtimeSerialConfiguration()}
+    };
+    m_lastResult = QStringLiteral("CANCELLED");
+}
+
+[[noreturn]] void SerialTransport::throwCancelled(const char *context)
+{
+    const auto reason = static_cast<CancelReason>(m_cancelReason.load());
+    if (m_trace && m_pending) {
+        const auto &pending = *m_pending;
+        m_trace(QStringLiteral("[transport] REQUEST_CANCELLED request_id=%1 logical_channel=%2 address=%3 command=%4 "
+                               "service=0x%5 class=0x%6 instance=%7 attribute=0x%8 state=%9 reason=%10 context=%11")
+            .arg(pending.requestId).arg(pending.logicalChannel).arg(pending.protocolAddress)
+            .arg(commandName(pending.service)).arg(pending.service, 2, 16, QLatin1Char('0'))
+            .arg(pending.commandClass, 2, 16, QLatin1Char('0')).arg(pending.instance)
+            .arg(pending.attribute, 2, 16, QLatin1Char('0')).arg(stateName(m_state))
+            .arg(cancelReasonName(reason), QString::fromLatin1(context)));
+    } else if (m_trace) {
+        m_trace(QStringLiteral("[transport] REQUEST_CANCELLED request_id=NONE state=%1 reason=%2 context=%3")
+            .arg(stateName(m_state), cancelReasonName(reason), QString::fromLatin1(context)));
+    }
+    if (!m_pending)
+        recordPreCreateCancellation(context);
+    throw Cancelled("transaction cancelled");
+}
 
 void SerialTransport::open(const QString &portName, qint32 baudRate)
 {
@@ -70,7 +133,10 @@ void SerialTransport::open(const QString &portName, qint32 baudRate)
     if (m_openedPortPath.isEmpty()) m_openedPortPath = portName;
     if (m_trace) {
         const auto config = runtimeSerialConfiguration();
-        m_trace(QStringLiteral("OPEN %1 runtime_baud=%2 data_bits=%3 parity=%4 stop_bits=%5 flow_control=%6")
+        if (reopening)
+            m_trace(QStringLiteral("[transport] SERIAL_REOPEN port=%1 runtime_baud=%2")
+                .arg(portName).arg(config.value("baudRate").toInt()));
+        m_trace(QStringLiteral("[transport] OPEN port=%1 runtime_baud=%2 data_bits=%3 parity=%4 stop_bits=%5 flow_control=%6")
             .arg(portName).arg(config.value("baudRate").toInt()).arg(config.value("dataBits").toString(),
                 config.value("parity").toString(), config.value("stopBits").toString(),
                 config.value("flowControl").toString()));
@@ -82,7 +148,8 @@ void SerialTransport::close()
     if (m_port.isOpen()) {
         const QString name = m_port.portName();
         m_port.close();
-        if (m_trace) m_trace(QStringLiteral("CLOSE %1").arg(name));
+        if (m_trace) m_trace(QStringLiteral("[transport] CLOSE port=%1 pending=%2 state=%3")
+                             .arg(name).arg(m_pending.has_value()).arg(stateName(m_state)));
     }
     m_parser.reset();
     m_pending.reset();
@@ -105,7 +172,7 @@ qint64 SerialTransport::write(const QByteArray &bytes)
     QElapsedTimer timer;
     timer.start();
     while (m_port.bytesToWrite() > 0) {
-        if (m_cancelRequested.load()) throw Cancelled("transaction cancelled");
+        if (m_cancelRequested.load()) throwCancelled("WRITE_WAIT_FOR_BYTES_WRITTEN");
         const int remaining = 100 - static_cast<int>(timer.elapsed());
         if (remaining <= 0 || !m_port.waitForBytesWritten(qMin(10, remaining))) {
             if (m_port.error() != QSerialPort::NoError && m_port.error() != QSerialPort::TimeoutError)
@@ -113,7 +180,7 @@ qint64 SerialTransport::write(const QByteArray &bytes)
             if (remaining <= 0) throw Timeout("serial write timeout");
         }
     }
-    if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("TX %1").arg(hex(bytes)));
+    if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("[transport] TX_RAW bytes=%1").arg(hex(bytes)));
     return written;
 }
 
@@ -123,7 +190,7 @@ QByteArray SerialTransport::read(qint64 maximum, int timeoutMs)
     QElapsedTimer timer;
     timer.start();
     while (m_port.bytesAvailable() == 0) {
-        if (m_cancelRequested.load()) throw Cancelled("transaction cancelled");
+        if (m_cancelRequested.load()) throwCancelled("READ_WAIT_FOR_READY_READ");
         const int remaining = timeoutMs - static_cast<int>(timer.elapsed());
         if (remaining <= 0) throw Timeout("serial read timeout");
         if (!m_port.waitForReadyRead(qMin(10, remaining))
@@ -233,7 +300,7 @@ bool SerialTransport::recoverBus(const QString &reason, const PendingRequest &pe
     // A reset alone cannot establish a byte-stream boundary.  Keep draining
     // until no new batch has appeared for a full quiet window.
     while (timer.elapsed() < RxRecoveryTimeoutMs) {
-        if (m_cancelRequested.load()) throw Cancelled("transaction cancelled");
+        if (m_cancelRequested.load()) throwCancelled("BUS_RECOVERY_WAIT");
         const qint64 available = m_port.bytesAvailable();
         if (available > 0) {
             const QByteArray bytes = m_port.read(available);
@@ -293,9 +360,9 @@ bool SerialTransport::recoverBus(const QString &reason, const PendingRequest &pe
         {"rxPendingAtEnd", pendingAtEnd}, {"hardRecovery", hardRecovery},
         {"result", success ? "SUCCESS" : "FAILED"}};
     m_recoveryEvents.append(event);
-    if (m_trace) m_trace(QStringLiteral("#%1 BUS_RECOVERY address=%2 attempt=%3 reason=%4 pending_start=%5 "
-                                        "discarded=%6 quiet_ms=%7 pending_end=%8 result=%9")
-        .arg(pending.requestId).arg(pending.protocolAddress).arg(attempt).arg(reason)
+    if (m_trace) m_trace(QStringLiteral("[transport] BUS_RECOVERY request_id=%1 logical_channel=%2 address=%3 attempt=%4 reason=%5 pending_start=%6 "
+                                        "discarded=%7 quiet_ms=%8 pending_end=%9 result=%10")
+        .arg(pending.requestId).arg(pending.logicalChannel).arg(pending.protocolAddress).arg(attempt).arg(reason)
         .arg(pendingAtStart).arg(discarded.size()).arg(quietWaitMs).arg(pendingAtEnd)
         .arg(success ? QStringLiteral("SUCCESS") : QStringLiteral("FAILED")));
     return success;
@@ -357,8 +424,9 @@ QByteArray SerialTransport::readResponseFrame(int timeoutMs, const PendingReques
             throw;
         }
         if (allReceived) *allReceived += bytes;
-        if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("#%1 RX_BYTES %2 parser=%3")
-            .arg(pending.requestId).arg(hex(bytes), m_parser.stateName()));
+        if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("[transport] RX_BYTES request_id=%1 logical_channel=%2 address=%3 bytes=%4 parser=%5")
+            .arg(pending.requestId).arg(pending.logicalChannel).arg(pending.protocolAddress)
+            .arg(hex(bytes), m_parser.stateName()));
         const auto events = m_parser.feed(bytes);
         for (const auto &event : events) {
             if (event.type == MfcProtocol::ParseEvent::Type::Error) {
@@ -399,8 +467,9 @@ QByteArray SerialTransport::readResponseFrame(int timeoutMs, const PendingReques
                 // transaction state machine will drain it before retransmit.
                 throw ProtocolFailure(event.error.toStdString());
             }
-            if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("#%1 RX_FRAME_COMPLETE address=%2 frame=%3")
-                .arg(pending.requestId).arg(pending.protocolAddress).arg(hex(event.bytes)));
+            if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("[transport] RX_FRAME_COMPLETE request_id=%1 logical_channel=%2 address=%3 frame=%4 checksum_expected=%5 checksum_received=%6")
+                .arg(pending.requestId).arg(pending.logicalChannel).arg(pending.protocolAddress).arg(hex(event.bytes))
+                .arg(event.checksumExpected).arg(event.checksumReceived));
             m_frameCompleteTimestamp = QDateTime::currentDateTime();
             if (event.bytes.size() > 2) m_lastReceivedService = static_cast<quint8>(event.bytes[2]);
             if (event.bytes.size() > 4) m_lastReceivedClass = static_cast<quint8>(event.bytes[4]);
@@ -493,6 +562,7 @@ void SerialTransport::finishCurrentTransaction(const QString &result, const QStr
         ? -1 : static_cast<quint8>(m_lastResponseFrame[0]);
     m_lastTransaction = {
         {"requestId", static_cast<qulonglong>(pending.requestId)},
+        {"origin", m_transactionOrigin},
         {"previousRequestId", static_cast<qulonglong>(m_previousRequestId)},
         {"address", pending.protocolAddress}, {"service", pending.service},
         {"commandClass", pending.commandClass}, {"instance", pending.instance},
@@ -547,12 +617,14 @@ void SerialTransport::finishCurrentTransaction(const QString &result, const QStr
         {"txToFirstRxMs", txToFirstRxMs}, {"txToFrameCompleteMs", txToFrameCompleteMs},
         {"serialConfiguration", runtimeSerialConfiguration()}
     };
-    if (m_trace) m_trace(QStringLiteral("#%1 REQUEST_FINISHED result=%2 logical_channel=%3 address=%4 elapsed_ms=%5 "
-                                        "previous_request_id=%6 next_request_id=%7 previousFinishToNextTxMs=%8 retry_count=%9 detail=%10")
+    if (m_trace) m_trace(QStringLiteral("[transport] REQUEST_FINISHED request_id=%1 result=%2 logical_channel=%3 address=%4 service=0x%5 class=0x%6 instance=%7 attribute=0x%8 state=%9 elapsed_ms=%10 "
+                                        "previous_request_id=%11 next_request_id=%12 previousFinishToNextTxMs=%13 retry_count=%14 checksum_expected=%15 checksum_received=%16 detail=%17")
         .arg(pending.requestId).arg(result).arg(pending.logicalChannel)
-        .arg(pending.protocolAddress).arg(elapsedMs).arg(m_previousRequestId)
+        .arg(pending.protocolAddress).arg(pending.service, 2, 16, QLatin1Char('0'))
+        .arg(pending.commandClass, 2, 16, QLatin1Char('0')).arg(pending.instance)
+        .arg(pending.attribute, 2, 16, QLatin1Char('0')).arg(stateName(m_state)).arg(elapsedMs).arg(m_previousRequestId)
         .arg(nextRequestId.load()).arg(gapMs < 0 ? QStringLiteral("N/A") : QString::number(gapMs, 'f', 3))
-        .arg(qMax(0, m_attemptCount - 1)).arg(detail));
+        .arg(qMax(0, m_attemptCount - 1)).arg(m_lastChecksumExpected).arg(m_lastChecksumReceived).arg(detail));
     if (m_trace && m_errorRawOnly && !m_attemptErrors.isEmpty()) {
         const QString errors = QString::fromUtf8(
             QJsonDocument::fromVariant(m_attemptErrors).toJson(QJsonDocument::Compact));
@@ -578,7 +650,7 @@ QByteArray SerialTransport::transaction(const QByteArray &request, int ackTimeou
     retries = qBound(0, retries, 1);
     if (request.size() < 9) throw Error("request too short");
     if (m_pending) throw Error("a serial transaction is already pending");
-    if (m_cancelRequested.load()) throw Cancelled("transaction cancelled");
+    if (m_cancelRequested.load()) throwCancelled("REQUEST_BEFORE_CREATE");
     PendingRequest pending;
     pending.requestId = nextRequestId.fetch_add(1);
     pending.protocolAddress = static_cast<quint8>(request[0]);
@@ -626,10 +698,10 @@ QByteArray SerialTransport::transaction(const QByteArray &request, int ackTimeou
         QElapsedTimer *timer;
         ~FinishGuard() { owner->finishCurrentTransaction(*result, *detail, timer->elapsed()); }
     } finishGuard{this, &finalResult, &finalDetail, &transactionTimer};
-    if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("#%1 REQUEST_CREATED logical_channel=%2 address=%3 service=0x%4 class=0x%5 "
-                                        "instance=%6 attr=0x%7 retries=%8")
+    if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("[transport] REQUEST_CREATED request_id=%1 logical_channel=%2 address=%3 command=%4 service=0x%5 class=0x%6 "
+                                        "instance=%7 attr=0x%8 retries=%9")
         .arg(pending.requestId).arg(pending.logicalChannel).arg(pending.protocolAddress)
-        .arg(pending.service, 2, 16, QLatin1Char('0'))
+        .arg(commandName(pending.service)).arg(pending.service, 2, 16, QLatin1Char('0'))
         .arg(pending.commandClass, 2, 16, QLatin1Char('0')).arg(pending.instance)
         .arg(pending.attribute, 2, 16, QLatin1Char('0')).arg(retries));
     std::string lastError = "transaction failed";
@@ -637,6 +709,8 @@ QByteArray SerialTransport::transaction(const QByteArray &request, int ackTimeou
     bool lastWasProtocol = false;
     for (int attempt = 0; attempt <= retries; ++attempt) {
         m_attemptCount = attempt + 1;
+        if (attempt > 0 && m_trace) m_trace(QStringLiteral("[transport] RETRY_BEGIN request_id=%1 attempt=%2")
+            .arg(pending.requestId).arg(attempt + 1));
         const int attemptRxStart = m_lastRx.size();
         const int errorCountAtStart = m_attemptErrors.size();
         const QDateTime attemptStartedAt = QDateTime::currentDateTime();
@@ -689,26 +763,31 @@ QByteArray SerialTransport::transaction(const QByteArray &request, int ackTimeou
                 m_currentTxTimestamp = QDateTime::currentDateTime();
             }
             const double gapMs = m_lastFinishNs >= 0 ? (attemptTxNs - m_lastFinishNs) / 1000000.0 : -1.0;
-            if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("#%1 TX_BEGIN attempt=%2 address=%3 previousFinishToNextTxMs=%4")
-                .arg(pending.requestId).arg(attempt + 1).arg(pending.protocolAddress)
+            if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("[transport] TX_BEGIN request_id=%1 logical_channel=%2 address=%3 attempt=%4 tx_timestamp=%5 previousFinishToNextTxMs=%6")
+                .arg(pending.requestId).arg(pending.logicalChannel).arg(pending.protocolAddress).arg(attempt + 1)
+                .arg(QDateTime::currentDateTime().toString(Qt::ISODateWithMs))
                 .arg(gapMs < 0 ? QStringLiteral("N/A") : QString::number(gapMs, 'f', 3)));
-            if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("#%1 TX attempt=%2 address=%3 bytes=%4")
-                .arg(pending.requestId).arg(attempt + 1).arg(pending.protocolAddress).arg(hex(request)));
+            if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("[transport] TX request_id=%1 logical_channel=%2 address=%3 attempt=%4 bytes=%5")
+                .arg(pending.requestId).arg(pending.logicalChannel).arg(pending.protocolAddress).arg(attempt + 1).arg(hex(request)));
             m_state = TransactionState::Tx;
             write(request);
             m_state = TransactionState::WaitAck;
             acknowledge = readExact(1, ackTimeoutMs);
             m_lastAck = acknowledge;
             const quint8 ack = static_cast<quint8>(acknowledge[0]);
-            if (m_trace && !m_errorRawOnly) m_trace(ack == MfcProtocol::Ack ? QStringLiteral("RX ACK 06")
-                                                         : QStringLiteral("RX CONTROL %1").arg(hex(acknowledge)));
+            if (m_trace && !m_errorRawOnly) m_trace(ack == MfcProtocol::Ack
+                ? QStringLiteral("[transport] ACK request_id=%1 logical_channel=%2 address=%3 value=06")
+                    .arg(pending.requestId).arg(pending.logicalChannel).arg(pending.protocolAddress)
+                : QStringLiteral("[transport] RX_CONTROL request_id=%1 logical_channel=%2 address=%3 value=%4")
+                    .arg(pending.requestId).arg(pending.logicalChannel).arg(pending.protocolAddress).arg(hex(acknowledge)));
             if (ack == MfcProtocol::Nak) throw NegativeAcknowledge("MFC returned NAK");
             if (ack != MfcProtocol::Ack) throw ProtocolFailure("invalid ACK byte");
             QByteArray received;
             m_state = TransactionState::ReadFrame;
             QByteArray packet = readResponseFrame(responseTimeoutMs, pending, &received);
             m_lastResponseFrame = packet;
-            if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("RX %1").arg(hex(packet)));
+            if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("[transport] RX request_id=%1 logical_channel=%2 address=%3 frame=%4")
+                .arg(pending.requestId).arg(pending.logicalChannel).arg(pending.protocolAddress).arg(hex(packet)));
             finalResult = QStringLiteral("SUCCESS");
             finalDetail = QStringLiteral("valid response");
             m_state = TransactionState::Success;
@@ -718,8 +797,9 @@ QByteArray SerialTransport::transaction(const QByteArray &request, int ackTimeou
                 {"txTimestamp", attemptStartedAt.toString(Qt::ISODateWithMs)}, {"ackRaw", hex(acknowledge)},
                 {"rxRaw", hex(m_lastRx.mid(attemptRxStart))}, {"responseFrame", hex(packet)},
                 {"protocolEvents", m_attemptErrors.size() - errorCountAtStart}});
-            if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("#%1 REQUEST_SUCCESS address=%2 attempt=%3")
-                .arg(pending.requestId).arg(pending.protocolAddress).arg(attempt + 1));
+            if (m_trace && !m_errorRawOnly) m_trace(QStringLiteral("[transport] REQUEST_SUCCESS request_id=%1 logical_channel=%2 address=%3 attempt=%4 checksum_expected=%5 checksum_received=%6")
+                .arg(pending.requestId).arg(pending.logicalChannel).arg(pending.protocolAddress).arg(attempt + 1)
+                .arg(m_lastChecksumExpected).arg(m_lastChecksumReceived));
             return packet;
         } catch (const NegativeAcknowledge &error) {
             finalResult = QStringLiteral("PROTOCOL_ERROR");
@@ -772,6 +852,9 @@ QByteArray SerialTransport::transaction(const QByteArray &request, int ackTimeou
                 lastError = finalDetail.toStdString();
                 break;
             }
+            if (m_trace) m_trace(QStringLiteral("[transport] RETRY_DECISION request_id=%1 origin=%2 reason=%3 attempt=%4 max_attempts=%5 will_retry=%6")
+                .arg(pending.requestId).arg(m_transactionOrigin.isEmpty() ? QStringLiteral("UNSPECIFIED") : m_transactionOrigin)
+                .arg(recoveryReason).arg(attempt + 1).arg(retries + 1).arg(attempt < retries));
             if (attempt == retries) break;
             m_state = TransactionState::Retry;
         } catch (const Timeout &error) {
@@ -799,6 +882,9 @@ QByteArray SerialTransport::transaction(const QByteArray &request, int ackTimeou
                 lastWasProtocol = true;
                 break;
             }
+            if (m_trace) m_trace(QStringLiteral("[transport] RETRY_DECISION request_id=%1 origin=%2 reason=RESPONSE_TIMEOUT attempt=%3 max_attempts=%4 will_retry=%5")
+                .arg(pending.requestId).arg(m_transactionOrigin.isEmpty() ? QStringLiteral("UNSPECIFIED") : m_transactionOrigin)
+                .arg(attempt + 1).arg(retries + 1).arg(attempt < retries));
             if (attempt == retries) break;
             m_state = TransactionState::Retry;
         } catch (const std::exception &error) {
@@ -843,7 +929,7 @@ void SerialTransport::transactionAck(const QByteArray &request, int ackTimeoutMs
     if (request.size() < 9 || static_cast<quint8>(request[2]) != MfcProtocol::WriteService)
         throw Error("invalid ACK-only request");
     if (m_pending) throw Error("a serial transaction is already pending");
-    if (m_cancelRequested.load()) throw Cancelled("transaction cancelled");
+    if (m_cancelRequested.load()) throwCancelled("ACK_ONLY_BEFORE_CREATE");
     PendingRequest pending;
     pending.requestId = nextRequestId.fetch_add(1); pending.protocolAddress = static_cast<quint8>(request[0]);
     pending.service = static_cast<quint8>(request[2]); pending.commandClass = static_cast<quint8>(request[4]);

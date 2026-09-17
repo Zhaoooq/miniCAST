@@ -132,6 +132,29 @@ MFC 通信日志默认只写结构化 INFO 事件，不把每次轮询的原始�
 
 完整接线、Read Flow、Digital Setpoint 和 USB 拔插验证见 [REAL_MFC_TEST.md](REAL_MFC_TEST.md)。通讯日志位于应用数据目录的 `logs/mfc-communication.log`，单文件 1 MiB、保留 5 个轮转文件。
 
+### DeviceInfo 与通讯恢复
+
+“验证设备信息”和控制前的身份校验会在同一条串口总线上顺序执行，并在扫描期间暂时挂起常规 `READ_FLOW` 轮询。扫描完成后，只有下一次成功的 `READ_FLOW` 才会重新启动通讯看门狗，因此完整的多设备读取不会被误判为工作线程卡死；真正的轮询停滞仍会触发恢复。
+
+每个 DeviceInfo 属性固定最多尝试两次，日志会记录重试恢复、取消来源、原始帧和解析结果。RS485 Address 按单字节解析；Target 与 Calibration 的满量程允许不同，二者差异本身不是报警。一次完整、匹配的身份校验结果仅在连接、配置和设备地址均未改变的情况下短暂用于紧接着的“开始控制”预检。
+
+### 只读现场诊断工具
+
+构建后另提供 `build/minicast-device-diag`，它使用与主程序相同的协议栈，但不启动 `READ_FLOW` 调度，也不会发送写命令。适合将单台设备（默认地址 36）与现场其余设备隔离比对：
+
+```bash
+# 自动寻找串口，读取地址 36 的 DeviceInfo
+./build/minicast-device-diag
+
+# 指定串口与地址
+./build/minicast-device-diag --port /dev/ttyUSB0 --address 36
+
+# 依次只读比较参考地址 32 至 36
+./build/minicast-device-diag --port /dev/ttyUSB0 --all-configured
+```
+
+工具逐项输出目标/标定气体与量程、型号、序列号、波特率和 RS485 地址，以及 TX、ACK、RX、校验、重试次数和解析结论。请在确认串口归属且没有其他程序占用总线时运行；现场诊断输出应保留在本机，不应提交到仓库。
+
 ## 当前限制
 
 - miniCAST 6204C / PDM-U 主机本身的协议仍未配置；本次真实接入范围是独立的 Sevenstar CS200-A MFC。

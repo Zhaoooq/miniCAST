@@ -20,6 +20,10 @@ public:
     // command while this shared byte stream is being brought back to idle.
     enum class TransactionState { Idle, PreTxCheck, Tx, WaitAck, ReadFrame,
                                   Validate, Success, Recovery, Retry, SerialDegraded, Failed };
+    // This is diagnostic attribution only.  It never changes the cancellation
+    // flag's timing or the transaction state machine's behaviour.
+    enum class CancelReason { Unspecified, MonitoringStop, DeviceDisconnect,
+                              ApplicationShutdown, ExperimentStop, WorkerWatchdog };
     class Error : public std::runtime_error { public: using std::runtime_error::runtime_error; };
     class Timeout : public Error { public: using Error::Error; };
     class NegativeAcknowledge : public Error { public: using Error::Error; };
@@ -42,9 +46,23 @@ public:
     // Whitelisted CS200 writes acknowledge with ACK only; they do not get a
     // fabricated read response.  It shares the exact same pending gate.
     void transactionAck(const QByteArray &request, int ackTimeoutMs = 40, int retries = 1);
-    void requestCancel() noexcept { m_cancelRequested.store(true); }
-    void clearCancellation() noexcept { m_cancelRequested.store(false); }
+    void requestCancel(CancelReason reason = CancelReason::Unspecified) noexcept {
+        // Preserve the first source until the worker observes/clears it.  A
+        // shutdown sequence may issue several follow-up stop calls, but they
+        // must not overwrite the actor that first requested cancellation.
+        int expected = static_cast<int>(CancelReason::Unspecified);
+        (void)m_cancelReason.compare_exchange_strong(expected, static_cast<int>(reason));
+        m_cancelRequested.store(true);
+    }
+    void clearCancellation() noexcept {
+        m_cancelRequested.store(false);
+        m_cancelReason.store(static_cast<int>(CancelReason::Unspecified));
+    }
     void setLogicalChannel(int channel) { m_logicalChannel = channel; }
+    // DeviceInfo callers set this for the duration of their logical scan so
+    // transport retry decisions can be attributed without changing protocol
+    // behaviour.
+    void setTransactionOrigin(const QString &origin) { m_transactionOrigin = origin; }
     bool transactionPending() const { return m_pending.has_value(); }
     void setErrorRawOnly(bool enabled) { m_errorRawOnly = enabled; }
     void setExperimentDiagnostics(bool enabled) { m_experimentDiagnostics = enabled; }
@@ -89,6 +107,9 @@ private:
                     bool hardRecovery = false);
     void recordProtocolFailure(const QString &reason);
     static QString stateName(TransactionState state);
+    static QString cancelReasonName(CancelReason reason);
+    void recordPreCreateCancellation(const char *context);
+    [[noreturn]] void throwCancelled(const char *context);
     void noteRxBytes(const QByteArray &bytes);
     QVariantMap runtimeSerialConfiguration() const;
     void finishCurrentTransaction(const QString &result, const QString &detail,
@@ -98,6 +119,7 @@ private:
     MfcProtocol::ResponseStreamParser m_parser;
     std::optional<PendingRequest> m_pending;
     std::atomic_bool m_cancelRequested{false};
+    std::atomic_int m_cancelReason{static_cast<int>(CancelReason::Unspecified)};
     quint64 m_previousRequestId{0};
     quint64 m_lastFinishedRequestId{0};
     QString m_lastResult;
@@ -123,6 +145,7 @@ private:
     bool m_errorRawOnly{false};
     bool m_experimentDiagnostics{false};
     int m_logicalChannel{0};
+    QString m_transactionOrigin;
     QByteArray m_rxHistory;
     quint64 m_rxSequence{0};
     QVariantList m_rxBatches;

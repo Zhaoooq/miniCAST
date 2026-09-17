@@ -26,7 +26,8 @@ Item {
                                       : (result.statusText || "读取失败")
     }
     function metadataStatus(result) {
-        return result.statusText || "读取失败"
+        var status = result.statusText || "读取失败"
+        return result.error ? status + "：" + result.error : status
     }
     function diagnosticSampleValue(sample) {
         return sample.value !== undefined ? String(sample.value) : "失败"
@@ -356,7 +357,7 @@ Item {
                             Text { visible: modelData.metadataVerificationAttempted; text: "Target：Gas Name " + root.metadataValue(targetName) + "（" + root.metadataStatus(targetName) + "） · Gas Code " + root.metadataValue(targetCode) + "（" + root.metadataStatus(targetCode) + "）"; color: Theme.textPrimary; font.pixelSize: 10; elide: Text.ElideRight; width: parent.width }
                             Text { visible: modelData.metadataVerificationAttempted; text: "Target Full Scale：" + root.metadataValue(targetScale, " SCCM") + "（" + root.metadataStatus(targetScale) + "）"; color: targetScale.status === "MISMATCH" ? Theme.red : Theme.textPrimary; font.pixelSize: 10; elide: Text.ElideRight; width: parent.width }
                             Text { visible: modelData.metadataVerificationAttempted; text: "Calibration：Gas Name " + root.metadataValue(calibrationName) + " · Gas Code " + root.metadataValue(calibrationCode) + " · Full Scale " + root.metadataValue(calibrationScale, " SCCM"); color: Theme.textSecondary; font.pixelSize: 10; elide: Text.ElideRight; width: parent.width }
-                            Text { visible: modelData.metadataVerificationAttempted; text: "RS485 " + root.metadataValue(addressResult) + " · Model " + root.metadataValue(modelResult) + " · Serial " + root.metadataValue(serialResult) + " · Baud " + root.metadataValue(baudResult); color: Theme.textSecondary; font.pixelSize: 10; elide: Text.ElideRight; width: parent.width }
+                            Text { visible: modelData.metadataVerificationAttempted; text: "RS485 Address：" + root.metadataValue(addressResult) + " · Model " + root.metadataValue(modelResult) + " · Serial " + root.metadataValue(serialResult) + " · Baud " + root.metadataValue(baudResult); color: Theme.textSecondary; font.pixelSize: 10; elide: Text.ElideRight; width: parent.width }
                             Text { visible: modelData.metadataVerificationAttempted; text: modelData.verificationMatches ? "✓ 状态：一致" : "⚠ 状态：" + (modelData.lastError || "设备配置与现场配置不一致"); color: modelData.verificationMatches ? Theme.green : Theme.red; font.pixelSize: 10; font.weight: Font.DemiBold; elide: Text.ElideRight; width: parent.width }
                         }
                     }
@@ -489,8 +490,11 @@ Item {
                                 property var target: (modelData.metadataResults || {})["Target Full Scale"] || ({})
                                 property var calibration: (modelData.metadataResults || {})["Calibration Full Scale"] || ({})
                                 visible: modelData.metadataVerificationAttempted && target.reportedAvailable && calibration.reportedAvailable && target.reported !== calibration.reported
-                                text: "Target Full Scale 与标定量程不同"
-                                color: Theme.yellow; font.pixelSize: 9; font.weight: Font.DemiBold
+                                // Target-gas range and calibration-gas range are independent
+                                // device metadata.  A difference is expected for many gases,
+                                // and is not a configuration or communication warning.
+                                text: "设备标定信息：Target 与 Calibration 量程不同"
+                                color: Theme.textSecondary; font.pixelSize: 9
                             }
                         }
                         Column {

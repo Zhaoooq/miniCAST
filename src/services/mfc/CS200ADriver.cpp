@@ -86,6 +86,15 @@ quint16 CS200ADriver::readUInt16(quint8 commandClass, quint8 attribute)
         throw MfcProtocol::Error("UINT16_PAYLOAD_TOO_SHORT");
     return MfcProtocol::readUInt16Le(payload);
 }
+quint8 CS200ADriver::readUInt8(quint8 commandClass, quint8 attribute)
+{
+    const QByteArray payload = readAttribute(commandClass, attribute).data;
+    if (payload.isEmpty())
+        throw MfcProtocol::Error("EMPTY_PAYLOAD: UINT8 attribute returned no data");
+    if (payload.size() != 1)
+        throw MfcProtocol::Error("UINT8_PAYLOAD_LENGTH_INVALID");
+    return MfcProtocol::readUInt8(payload);
+}
 void CS200ADriver::writeAttribute(quint8 commandClass, quint8 attribute, const QByteArray &data)
 {
     const auto request = MfcProtocol::makeRequest(m_info.address, MfcProtocol::WriteService,
@@ -128,7 +137,7 @@ QString CS200ADriver::readCalibrationGasName() { return MfcProtocol::decodeText(
 quint16 CS200ADriver::readCalibrationGasCode() { return readUInt16(0x66, 0x07); }
 quint16 CS200ADriver::readCalibrationGasFullScale() { return readUInt16(0x66, 0x08); }
 double CS200ADriver::readConversionFactor() { return MfcProtocol::decodeFixed16_16(readAttribute(0x66, 0x04).data); }
-quint16 CS200ADriver::readRs485MacAddress() { return readUInt16(0x03, 0x01); }
+quint8 CS200ADriver::readRs485MacAddress() { return readUInt8(0x03, 0x01); }
 quint16 CS200ADriver::readBaudRate() { return readUInt16(0x03, 0x02); }
 MfcReading CS200ADriver::readFlow()
 {

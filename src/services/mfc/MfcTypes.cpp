@@ -93,8 +93,12 @@ QVariantMap MfcDeviceState::toVariantMap() const
     map["metadataDiagnostics"] = metadataDiagnostics;
     map["dataFresh"] = dataFresh;
     map["readOnly"] = true;
-    map["addressSource"] = addressDetected ? QStringLiteral("配置地址（只读响应已验证）")
-                                             : QStringLiteral("配置候选地址");
+    const bool addressRegisterMatches = metadataResults.value(QStringLiteral("RS485 Address")).toMap()
+        .value(QStringLiteral("status")).toString() == QStringLiteral("MATCH");
+    map["addressSource"] = addressRegisterMatches
+        ? QStringLiteral("RS485 MAC 地址寄存器（已确认）")
+        : addressDetected ? QStringLiteral("配置地址（READ_FLOW 已应答，地址寄存器未确认）")
+                          : QStringLiteral("配置候选地址");
     map["configurationStateText"] = config.addressConfirmed && engineeringConfigured
         ? QStringLiteral("配置完整，只读监测")
         : config.addressConfirmed ? QStringLiteral("工程配置待确认") : QStringLiteral("地址映射待确认");

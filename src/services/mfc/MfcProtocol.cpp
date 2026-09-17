@@ -253,6 +253,12 @@ quint16 readUInt16Le(const QByteArray &data)
     return qFromLittleEndian<quint16>(reinterpret_cast<const uchar *>(data.constData()));
 }
 
+quint8 readUInt8(const QByteArray &data)
+{
+    if (data.size() < 1) throw Error("UINT8 response too short");
+    return static_cast<quint8>(data[0]);
+}
+
 qint32 readInt32Le(const QByteArray &data)
 {
     if (data.size() < 4) throw Error("INT32 response too short");

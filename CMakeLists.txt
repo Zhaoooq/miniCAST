@@ -77,6 +77,20 @@ target_link_libraries(minicast-monitor PRIVATE
 
 install(TARGETS minicast-monitor RUNTIME DESTINATION bin)
 
+# Development/field diagnostic: deliberately a separate, read-only executable
+# so Address 36 can be interrogated without the production READ_FLOW scheduler.
+qt_add_executable(minicast-device-diag
+    tools/mfc_device_diag.cpp
+    src/services/mfc/MfcProtocol.h src/services/mfc/MfcProtocol.cpp
+    src/services/mfc/SerialTransport.h src/services/mfc/SerialTransport.cpp
+    src/services/mfc/DeviceDiscovery.h src/services/mfc/DeviceDiscovery.cpp
+    src/services/mfc/CS200ADriver.h src/services/mfc/CS200ADriver.cpp
+    src/services/mfc/MfcTypes.h src/services/mfc/MfcTypes.cpp
+)
+target_include_directories(minicast-device-diag PRIVATE src)
+target_link_libraries(minicast-device-diag PRIVATE Qt6::Core Qt6::SerialPort)
+install(TARGETS minicast-device-diag RUNTIME DESTINATION bin)
+
 include(CTest)
 if(BUILD_TESTING)
     qt_add_executable(minicast-core-tests

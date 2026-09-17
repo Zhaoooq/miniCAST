@@ -26,6 +26,7 @@
 #include <thread>
 #ifdef Q_OS_LINUX
 #include <fcntl.h>
+#include <sys/select.h>
 #include <stdlib.h>
 #include <unistd.h>
 #endif
@@ -95,6 +96,13 @@ int main(int argc, char **argv)
     }
     const auto fixedDevices = ConfigManager().mfcDevices();
 
+    ok &= require(!MonitoringController::shouldArmMonitoringWatchdog(false, false)
+                  && !MonitoringController::shouldArmMonitoringWatchdog(true, false)
+                  && MonitoringController::shouldArmMonitoringWatchdog(true, true)
+                  && !MonitoringController::shouldArmMonitoringWatchdog(true, true, true)
+                  && MonitoringController::shouldArmMonitoringWatchdog(true, false, true),
+                  "监控 watchdog 只能在 NORMAL_POLLING 且首个 READ_FLOW 成功后 arm");
+
     const QByteArray checksumInput = QByteArray::fromHex("200280036801B900");
     ok &= require(MfcProtocol::checksum(checksumInput) == 0xC7,
                   "Sevenstar 文档 Read Flow 校验和应为 C7");
@@ -109,11 +117,14 @@ int main(int argc, char **argv)
     const QByteArray fullScaleRequest = MfcProtocol::makeRequest(0x20, MfcProtocol::ReadService, 0x66, 0x01, 0x03);
     const QByteArray calibrationGasCodeRequest = MfcProtocol::makeRequest(0x20, MfcProtocol::ReadService, 0x66, 0x01, 0x07);
     const QByteArray calibrationFullScaleRequest = MfcProtocol::makeRequest(0x20, MfcProtocol::ReadService, 0x66, 0x01, 0x08);
+    const QByteArray rs485AddressRequest = MfcProtocol::makeRequest(0x20, MfcProtocol::ReadService, 0x03, 0x01, 0x01);
     ok &= require(gasCodeRequest == QByteArray::fromHex("20028003660102000E")
                   && fullScaleRequest == QByteArray::fromHex("20028003660103000F")
                   && calibrationGasCodeRequest == QByteArray::fromHex("200280036601070013")
                   && calibrationFullScaleRequest == QByteArray::fromHex("200280036601080014"),
                   "Target / Calibration Gas Code 与 Full Scale 必须严格使用 0x66/0x01 的只读属性");
+    ok &= require(rs485AddressRequest == QByteArray::fromHex("2002800303010100AA"),
+                  "RS485 MAC 地址必须使用协议定义的只读 0x03/0x01 请求");
     const auto metadataPacket = [](quint8 attribute, const QByteArray &payload) {
         QByteArray packet = QByteArray::fromHex("000280");
         packet.append(char(3 + payload.size())); packet.append(char(0x66)); packet.append(char(0x01));
@@ -126,12 +137,36 @@ int main(int argc, char **argv)
     const auto calibrationGasCodeResponse = MfcProtocol::parseResponse(metadataPacket(0x07, QByteArray::fromHex("0D00")), 0x66, 0x01, 0x07);
     const auto calibrationFullScaleResponse = MfcProtocol::parseResponse(metadataPacket(0x08, QByteArray::fromHex("1027")), 0x66, 0x01, 0x08);
     const auto emptyGasCodeResponse = MfcProtocol::parseResponse(metadataPacket(0x02, {}), 0x66, 0x01, 0x02);
+    const auto rs485AddressResponse = MfcProtocol::parseResponse(
+        [] { QByteArray p = QByteArray::fromHex("00028004"); p.append(char(0x03)); p.append(char(0x01));
+             p.append(char(0x01)); p.append(char(0x20)); p.append(char(0x00));
+             p.append(char(MfcProtocol::checksum(p))); return p; }(), 0x03, 0x01, 0x01);
     ok &= require(MfcProtocol::readUInt16Le(gasCodeResponse.data) == 8
                   && MfcProtocol::readUInt16Le(fullScaleResponse.data) == 4000
                   && MfcProtocol::readUInt16Le(calibrationGasCodeResponse.data) == 13
                   && MfcProtocol::readUInt16Le(calibrationFullScaleResponse.data) == 10000
                   && emptyGasCodeResponse.data.isEmpty(),
                   "Target/Calibration UINT16 metadata 必须小端解析，LEN=3 必须保留为空 payload 而非伪造值");
+    ok &= require(MfcProtocol::readUInt8(rs485AddressResponse.data) == 32,
+                  "协议 V2.3 的 RS485 MAC 地址响应是一个 UINT8，地址 32 必须可合法解析");
+    bool shortAddressRejected = false;
+    try { (void)MfcProtocol::readUInt8({}); } catch (const MfcProtocol::Error &) { shortAddressRejected = true; }
+    ok &= require(shortAddressRejected, "空的 RS485 地址响应不得用于地址确认");
+    MfcDeviceInfo wrongAddressInfo;
+    wrongAddressInfo.address = 33;
+    wrongAddressInfo.targetGasName = fixedDevices[0].gasType;
+    wrongAddressInfo.targetGasCode = fixedDevices[0].expectedGasCode;
+    wrongAddressInfo.fullScale = fixedDevices[0].expectedDeviceFullScaleSccm;
+    ok &= require(MfcManager::metadataMismatchFields(fixedDevices[0], wrongAddressInfo)
+                      == QStringList{QStringLiteral("RS485 Address")},
+                  "地址寄存器返回 33 而期望 32 时必须明确报地址不匹配");
+    MfcDeviceInfo propaneFormulaInfo;
+    propaneFormulaInfo.address = fixedDevices[1].address;
+    propaneFormulaInfo.targetGasName = QStringLiteral("C3H8");
+    propaneFormulaInfo.targetGasCode = fixedDevices[1].expectedGasCode;
+    propaneFormulaInfo.fullScale = fixedDevices[1].expectedDeviceFullScaleSccm;
+    ok &= require(MfcManager::metadataMismatchFields(fixedDevices[1], propaneFormulaInfo).isEmpty(),
+                  "设备返回 C3H8 时必须与现场配置的丙烷视为同一种气体");
     ok &= require(MfcProtocol::encodeUfrac16(0.0) == 0x4000
                   && MfcProtocol::encodeUfrac16(0.5) == 0x8000
                   && MfcProtocol::encodeUfrac16(1.0) == 0xC000,
@@ -546,6 +581,7 @@ int main(int argc, char **argv)
         bool attributeMismatchRecovered = false;
         bool queueAdvancedAfterThirdFailure = false;
         bool cancellationCaught = false;
+        bool preCreateCancellationSnapshotClean = false;
         bool tenThousandTransactionsFinished = false;
         bool reconnectSucceeded = false;
         bool errorRawEvidenceCaptured = false;
@@ -689,12 +725,16 @@ int main(int argc, char **argv)
             };
             QByteArray checksumBad = flowPacket;
             checksumBad[checksumBad.size() - 1] ^= char(0x01);
+            fakeTransport.setTransactionOrigin(QStringLiteral("CONTROL_PREFLIGHT"));
             checksumRecovered = transactionRecovers(checksumBad);
             {
                 const QVariantMap transaction = fakeTransport.diagnostics().value("lastTransaction").toMap();
                 const QVariantList errors = transaction.value("attemptErrors").toList();
                 const QVariantMap firstError = errors.isEmpty() ? QVariantMap{} : errors.first().toMap();
                 errorRawEvidenceCaptured = checksumRecovered
+                    && transaction.value("origin").toString() == QStringLiteral("CONTROL_PREFLIGHT")
+                    && transaction.value("result").toString() == QStringLiteral("SUCCESS")
+                    && transaction.value("retryCount").toInt() == 1
                     && firstError.value("errorType").toString() == QStringLiteral("checksum_error")
                     && !firstError.value("currentFrame").toString().isEmpty()
                     && !firstError.value("allRxRaw").toString().isEmpty()
@@ -707,6 +747,7 @@ int main(int argc, char **argv)
                     && transaction.value("serialConfiguration").toMap().value("baudRate").toInt() == 19200
                     && transaction.value("serialConfiguration").toMap().value("flowControl").toString() == QStringLiteral("NONE");
             }
+            fakeTransport.setTransactionOrigin({});
             QByteArray serviceBad = flowPacket;
             serviceBad[2] = char(0x81);
             serviceRecovered = transactionRecovers(serviceBad);
@@ -920,6 +961,24 @@ int main(int argc, char **argv)
             cancelPeer.join();
             fakeTransport.clearCancellation();
 
+            // A cancellation before a PendingRequest is created must replace
+            // (not inherit) the last successful transaction's raw evidence.
+            fakeTransport.requestCancel(SerialTransport::CancelReason::WorkerWatchdog);
+            try { (void)fakeTransport.transaction(secondRequest, 100, 100, 0); }
+            catch (const SerialTransport::Cancelled &) {
+                const QVariantMap cancelled = fakeTransport.diagnostics().value("lastTransaction").toMap();
+                preCreateCancellationSnapshotClean = !cancelled.value("transactionCreated", true).toBool()
+                    && cancelled.value("requestId").toULongLong() == 0
+                    && cancelled.value("result").toString() == QStringLiteral("CANCELLED")
+                    && cancelled.value("cancellationReason").toString() == QStringLiteral("WORKER_WATCHDOG")
+                    && cancelled.value("txRaw").toString().isEmpty()
+                    && cancelled.value("ackRaw").toString().isEmpty()
+                    && cancelled.value("rxRaw").toString().isEmpty()
+                    && cancelled.value("responseFrameRaw").toString().isEmpty()
+                    && cancelled.value("payloadRaw").toString().isEmpty();
+            }
+            fakeTransport.clearCancellation();
+
             constexpr int stressTransactions = 10000;
             bool stressAddressesObserved = true;
             std::thread stressPeer([ptyMaster, flowPacket, &stressAddressesObserved] {
@@ -1007,6 +1066,8 @@ int main(int argc, char **argv)
                       "五设备队列第 3 个失败后第 4、5 个仍必须执行");
         ok &= require(cancellationCaught && !fakeTransport.transactionPending(),
                       "pending request 必须可取消且统一清除 pending 状态");
+        ok &= require(preCreateCancellationSnapshotClean,
+                      "REQUEST_BEFORE_CREATE 取消不得复用上一 request 的 ID、TX、ACK、RX 或 payload");
         ok &= require(tenThousandTransactionsFinished,
                       "连续 10000 requests 后不得存在永久 pending transaction");
         ok &= require(reconnectSucceeded, "串口关闭并重连后事务必须恢复");
@@ -1071,7 +1132,7 @@ int main(int argc, char **argv)
                 else if (commandClass == 0x66 && attribute == 0x02) data = QByteArray::fromHex("5900"); // 89, not 8
                 else if (commandClass == 0x66 && attribute == 0x03) data = QByteArray::fromHex("E803");
                 else if (commandClass == 0x66 && attribute == 0x04) data = QByteArray::fromHex("00000100");
-                else if (commandClass == 0x03 && attribute == 0x01) data = QByteArray::fromHex("2000");
+                else if (commandClass == 0x03 && attribute == 0x01) data = QByteArray::fromHex("20");
                 else if (commandClass == 0x03 && attribute == 0x02) data = QByteArray::fromHex("004B");
                 const char ack = char(MfcProtocol::Ack);
                 (void)::write(preflightPtyMaster, &ack, 1);
@@ -1092,6 +1153,223 @@ int main(int argc, char **argv)
                       && controlWrites == 0 && preflightError.contains(QStringLiteral("Gas Code")),
                       "Preflight Gas Code mismatch 必须阻止 Controlling，且不得发送任何 Digital Setpoint/CM/Hold/Follow 写命令");
     }
+#endif
+
+// Regression for the field timeline: five sequential DeviceInfo reads take
+// longer than the former 2 s watchdog threshold.  Bootstrap must finish all
+// MFC5 attributes before the caller is allowed to begin READ_FLOW polling.
+#ifdef Q_OS_LINUX
+    const int bootstrapPtyMaster = posix_openpt(O_RDWR | O_NOCTTY);
+    const bool bootstrapPtyReady = bootstrapPtyMaster >= 0
+        && grantpt(bootstrapPtyMaster) == 0 && unlockpt(bootstrapPtyMaster) == 0;
+    ok &= require(bootstrapPtyReady, "应能创建 DeviceInfo bootstrap 伪串口");
+    if (bootstrapPtyReady) {
+        const QString bootstrapPort = QString::fromLocal8Bit(ptsname(bootstrapPtyMaster));
+        auto bootstrapDevices = fixedDevices;
+        for (auto &device : bootstrapDevices) device.addressConfirmed = true;
+        MfcManager::Settings bootstrapSettings;
+        bootstrapSettings.serialPort = bootstrapPort;
+        bootstrapSettings.ackTimeoutMs = 120;
+        bootstrapSettings.responseTimeoutMs = 120;
+        bootstrapSettings.retryCount = 0;
+        bootstrapSettings.communicationRecoverySuccessThreshold = 1;
+        bootstrapSettings.metadataInterRequestDelayMs = 20;
+        QStringList bootstrapTrace;
+        QList<QPair<int, QPair<int, int>>> bootstrapRequests;
+        std::thread bootstrapPeer([bootstrapPtyMaster, bootstrapDevices, &bootstrapRequests] {
+            const auto response = [](quint8 commandClass, quint8 attribute, const QByteArray &data) {
+                QByteArray packet = QByteArray::fromHex("000280");
+                packet.append(char(3 + data.size())); packet.append(char(commandClass)); packet.append(char(0x01));
+                packet.append(char(attribute)); packet.append(data); packet.append(char(0x00));
+                packet.append(char(MfcProtocol::checksum(packet))); return packet;
+            };
+            const auto u16le = [](quint16 value) {
+                QByteArray bytes;
+                bytes.append(char(value & 0xff));
+                bytes.append(char((value >> 8) & 0xff));
+                return bytes;
+            };
+            // Five connect probes + five complete (11-read) DeviceInfo
+            // bootstraps + one post-bootstrap READ_FLOW poll.
+            for (int transaction = 0; transaction < 61; ++transaction) {
+                char request[64]{};
+                const ssize_t size = ::read(bootstrapPtyMaster, request, sizeof(request));
+                if (size < 7) break;
+                const int address = static_cast<unsigned char>(request[0]);
+                const quint8 commandClass = static_cast<quint8>(request[4]);
+                const quint8 attribute = static_cast<quint8>(request[6]);
+                bootstrapRequests.append({address, {commandClass, attribute}});
+                const auto config = std::find_if(bootstrapDevices.cbegin(), bootstrapDevices.cend(),
+                    [address](const MfcDeviceConfig &device) { return device.address == address; });
+                if (config == bootstrapDevices.cend()) break;
+                QByteArray data;
+                if (commandClass == 0x68 && attribute == 0xB9) data = QByteArray::fromHex("0040");
+                else if (commandClass == 0x64 && attribute == 0x04) data = QByteArray("70J4L");
+                else if (commandClass == 0x64 && attribute == 0x07) data = QByteArray("0ZCSA038970");
+                else if (commandClass == 0x66 && (attribute == 0x01 || attribute == 0x06)) {
+                    data = config->address == 33 ? QByteArray("C3H8")
+                         : config->expectedGasCode == 13 ? QByteArray("NITROGEN") : QByteArray("AIR");
+                } else if (commandClass == 0x66 && (attribute == 0x02 || attribute == 0x07)) {
+                    data = u16le(config->expectedGasCode);
+                } else if (commandClass == 0x66 && (attribute == 0x03 || attribute == 0x08)) {
+                    data = u16le(static_cast<quint16>(config->expectedDeviceFullScaleSccm));
+                } else if (commandClass == 0x66 && attribute == 0x04) data = QByteArray::fromHex("00000100");
+                else if (commandClass == 0x03 && attribute == 0x01) data = QByteArray(1, char(address));
+                else if (commandClass == 0x03 && attribute == 0x02) data = QByteArray::fromHex("004B");
+                usleep(40000); // 55 metadata commands alone exceed 2.5 s.
+                const char ack = char(MfcProtocol::Ack);
+                (void)::write(bootstrapPtyMaster, &ack, 1);
+                const QByteArray packet = response(commandClass, attribute, data);
+                (void)::write(bootstrapPtyMaster, packet.constData(), packet.size());
+            }
+        });
+        MfcManager bootstrapManager(bootstrapDevices, bootstrapSettings,
+            [&bootstrapTrace](const QString &line) { bootstrapTrace.append(line); });
+        QElapsedTimer bootstrapElapsed;
+        bootstrapElapsed.start();
+        const bool bootstrapConnected = bootstrapManager.connectBus();
+        QString bootstrapError;
+        const bool bootstrapVerified = bootstrapConnected
+            && bootstrapManager.verifyDeviceInformation(&bootstrapError);
+        QString bootstrapPollError;
+        const bool postBootstrapPoll = bootstrapVerified && bootstrapManager.pollNext(&bootstrapPollError);
+        const qint64 bootstrapDurationMs = bootstrapElapsed.elapsed();
+        const auto bootstrapStates = bootstrapManager.devices();
+        bootstrapManager.disconnectBus(); bootstrapPeer.join(); ::close(bootstrapPtyMaster);
+        const QList<QPair<int, int>> expectedMfc5Metadata{{0x64, 0x04}, {0x64, 0x07}, {0x66, 0x01},
+            {0x66, 0x02}, {0x66, 0x03}, {0x66, 0x07}, {0x66, 0x08}, {0x66, 0x06},
+            {0x66, 0x04}, {0x03, 0x01}, {0x03, 0x02}};
+        QList<QPair<int, int>> mfc5Metadata;
+        for (const auto &request : bootstrapRequests)
+            if (request.first == 36 && request.second.first != 0x68) mfc5Metadata.append(request.second);
+        const QString joinedBootstrapTrace = bootstrapTrace.join('\n');
+        const bool allBootstrapMetadataComplete = std::all_of(bootstrapStates.cbegin(), bootstrapStates.cend(),
+            [](const MfcDeviceState &state) { return state.metadataVerificationComplete; });
+        ok &= require(bootstrapVerified && postBootstrapPoll && bootstrapDurationMs > 2500
+                      && allBootstrapMetadataComplete && mfc5Metadata == expectedMfc5Metadata
+                      && joinedBootstrapTrace.contains(QStringLiteral("DEVICE_INFO_ALL_COMPLETE result=SUCCESS")),
+                      "超过 watchdog 阈值的五机 DeviceInfo bootstrap 必须完整完成，MFC5 不得被取消且随后才可 READ_FLOW");
+    } else if (bootstrapPtyMaster >= 0) close(bootstrapPtyMaster);
+#endif
+
+// Regression for the running-mode field failure: after polling has already
+// armed its watchdog, a five-device DeviceInfo scan may last well beyond two
+// seconds (including a retry/recovery-sized jitter).  It must own the one
+// serial bus exclusively and resume with a fresh READ_FLOW baseline.
+#ifdef Q_OS_LINUX
+    const int lifecyclePtyMaster = posix_openpt(O_RDWR | O_NOCTTY);
+    const bool lifecyclePtyReady = lifecyclePtyMaster >= 0
+        && grantpt(lifecyclePtyMaster) == 0 && unlockpt(lifecyclePtyMaster) == 0;
+    ok &= require(lifecyclePtyReady, "应能创建运行中 DeviceInfo watchdog 回归伪串口");
+    if (lifecyclePtyReady) {
+        const QString lifecyclePort = QString::fromLocal8Bit(ptsname(lifecyclePtyMaster));
+        auto lifecycleDevices = fixedDevices;
+        for (auto &device : lifecycleDevices) device.addressConfirmed = true;
+        std::atomic_bool lifecyclePeerStop{false};
+        std::atomic_int metadataRequests{0};
+        std::atomic_int readFlowDuringMetadata{0};
+        std::atomic_int postScanReadFlows{0};
+        std::atomic_bool stallAfterPostScan{false};
+        std::thread lifecyclePeer([&] {
+            const auto response = [](quint8 commandClass, quint8 attribute, const QByteArray &data) {
+                QByteArray packet = QByteArray::fromHex("000280");
+                packet.append(char(3 + data.size())); packet.append(char(commandClass)); packet.append(char(0x01));
+                packet.append(char(attribute)); packet.append(data); packet.append(char(0x00));
+                packet.append(char(MfcProtocol::checksum(packet))); return packet;
+            };
+            const auto u16le = [](quint16 value) {
+                QByteArray bytes; bytes.append(char(value & 0xff)); bytes.append(char(value >> 8)); return bytes;
+            };
+            QByteArray buffered;
+            while (!lifecyclePeerStop.load()) {
+                fd_set readable; FD_ZERO(&readable); FD_SET(lifecyclePtyMaster, &readable);
+                timeval timeout{0, 100000};
+                if (::select(lifecyclePtyMaster + 1, &readable, nullptr, nullptr, &timeout) <= 0) continue;
+                char incoming[128];
+                const ssize_t count = ::read(lifecyclePtyMaster, incoming, sizeof(incoming));
+                if (count <= 0) continue;
+                buffered.append(incoming, static_cast<int>(count));
+                while (buffered.size() >= 4) {
+                    const int requestSize = static_cast<unsigned char>(buffered[3]) + 6;
+                    if (buffered.size() < requestSize) break;
+                    const QByteArray request = buffered.left(requestSize);
+                    buffered.remove(0, requestSize);
+                    const int address = static_cast<unsigned char>(request[0]);
+                    const quint8 commandClass = static_cast<quint8>(request[4]);
+                    const quint8 attribute = static_cast<quint8>(request[6]);
+                    const bool readFlow = commandClass == 0x68 && attribute == 0xB9;
+                    const int completedMetadata = metadataRequests.load();
+                    if (readFlow && completedMetadata > 0 && completedMetadata < 55)
+                        ++readFlowDuringMetadata;
+                    if (!readFlow) ++metadataRequests;
+                    const auto config = std::find_if(lifecycleDevices.cbegin(), lifecycleDevices.cend(),
+                        [address](const MfcDeviceConfig &device) { return device.address == address; });
+                    if (config == lifecycleDevices.cend()) continue;
+                    QByteArray data;
+                    if (commandClass == 0x68 && attribute == 0xB9) data = QByteArray::fromHex("0040");
+                    else if (commandClass == 0x64 && attribute == 0x04) data = QByteArray("70J4L");
+                    else if (commandClass == 0x64 && attribute == 0x07) data = QByteArray("0ZCSA038970");
+                    else if (commandClass == 0x66 && (attribute == 0x01 || attribute == 0x06))
+                        data = config->expectedGasCode == 13 ? QByteArray("NITROGEN") : QByteArray("AIR");
+                    else if (commandClass == 0x66 && (attribute == 0x02 || attribute == 0x07)) data = u16le(config->expectedGasCode);
+                    else if (commandClass == 0x66 && (attribute == 0x03 || attribute == 0x08)) data = u16le(static_cast<quint16>(config->expectedDeviceFullScaleSccm));
+                    else if (commandClass == 0x66 && attribute == 0x04) data = QByteArray::fromHex("00000100");
+                    else if (commandClass == 0x03 && attribute == 0x01) data = QByteArray(1, char(address));
+                    else if (commandClass == 0x03 && attribute == 0x02) data = QByteArray::fromHex("004B");
+                    // 50 ms per metadata command gives >2.7 s; a single
+                    // extra 80 ms models checksum retry/BUS_RECOVERY jitter.
+                    if (readFlow && completedMetadata >= 55 && stallAfterPostScan.load()) continue;
+                    if (!readFlow) usleep(metadataRequests.load() == 20 ? 80000 : 50000);
+                    const char ack = char(MfcProtocol::Ack); (void)::write(lifecyclePtyMaster, &ack, 1);
+                    const QByteArray packet = response(commandClass, attribute, data);
+                    (void)::write(lifecyclePtyMaster, packet.constData(), packet.size());
+                    if (readFlow && completedMetadata >= 55) ++postScanReadFlows;
+                }
+            }
+        });
+        QTemporaryDir lifecycleLogDirectory;
+        QStringList lifecycleErrors;
+        bool lifecycleMetadataComplete = false;
+        bool watchdogCancelledBeforeStall = false;
+        bool watchdogTriggeredAfterStall = false;
+        {
+            MonitoringController lifecycleController(500, 10.0, 20.0, 0.01, nullptr,
+                lifecycleLogDirectory.path(), lifecycleDevices, lifecyclePort, 19200, 120, 160, 0,
+                3, 3000, 0, 20, 3000, 20);
+            QObject::connect(&lifecycleController, &MonitoringController::errorOccurred,
+                [&lifecycleErrors](const QString &message) { lifecycleErrors.append(message); });
+            QElapsedTimer waitForPolling; waitForPolling.start();
+            while (!lifecycleController.monitoring() && waitForPolling.elapsed() < 3000)
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+            lifecycleController.verifyDeviceInformation();
+            QElapsedTimer waitForScan; waitForScan.start();
+            while (waitForScan.elapsed() < 7000) {
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+                const QVariantList states = lifecycleController.deviceInfo().value("devices").toList();
+                lifecycleMetadataComplete = states.size() == 5 && std::all_of(states.cbegin(), states.cend(),
+                    [](const QVariant &item) { return item.toMap().value("metadataVerificationComplete").toBool(); });
+                if (lifecycleMetadataComplete && metadataRequests.load() >= 55 && postScanReadFlows.load() > 0) break;
+            }
+            QElapsedTimer armDelivery; armDelivery.start();
+            while (armDelivery.elapsed() < 200)
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+            watchdogCancelledBeforeStall = std::any_of(lifecycleErrors.cbegin(), lifecycleErrors.cend(),
+                [](const QString &message) { return message.contains(QStringLiteral("COMMUNICATION_WORKER_STALLED")); });
+            stallAfterPostScan.store(true);
+            QElapsedTimer waitForRealStall; waitForRealStall.start();
+            while (waitForRealStall.elapsed() < 2800)
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+            watchdogTriggeredAfterStall = std::any_of(lifecycleErrors.cbegin(), lifecycleErrors.cend(),
+                [](const QString &message) { return message.contains(QStringLiteral("COMMUNICATION_WORKER_STALLED")); });
+            ok &= require(!watchdogCancelledBeforeStall && watchdogTriggeredAfterStall,
+                          "post-DeviceInfo 首个 READ_FLOW 成功后，真实 polling stall 仍必须触发 watchdog");
+        }
+        lifecyclePeerStop.store(true); lifecyclePeer.join(); ::close(lifecyclePtyMaster);
+        ok &= require(lifecycleMetadataComplete && metadataRequests.load() >= 55
+                      && postScanReadFlows.load() > 0 && readFlowDuringMetadata.load() == 0
+                      && !watchdogCancelledBeforeStall && watchdogTriggeredAfterStall,
+                      "运行中超过 2 秒且含 BUS_RECOVERY 抖动的五机 DeviceInfo 必须完整、独占总线且不得触发 WORKER_WATCHDOG");
+    } else if (lifecyclePtyMaster >= 0) close(lifecyclePtyMaster);
 #endif
 
 // CS200 replies use address 0x00.  Two devices deliberately return different
@@ -1147,7 +1425,7 @@ int main(int argc, char **argv)
                 else if (commandClass == 0x66 && attribute == 0x07) data = is32 ? QByteArray::fromHex("0800") : QByteArray::fromHex("0D00");
                 else if (commandClass == 0x66 && attribute == 0x08) data = is32 ? QByteArray::fromHex("E803") : QByteArray::fromHex("3200");
                 else if (commandClass == 0x66 && attribute == 0x04) data = QByteArray::fromHex("00000100");
-                else if (commandClass == 0x03 && attribute == 0x01) data = is32 ? QByteArray::fromHex("2000") : QByteArray::fromHex("2200");
+                else if (commandClass == 0x03 && attribute == 0x01) data = is32 ? QByteArray::fromHex("20") : QByteArray::fromHex("22");
                 else if (commandClass == 0x03 && attribute == 0x02) data = QByteArray::fromHex("004B");
                 const char ack = char(MfcProtocol::Ack);
                 (void)::write(attributionPtyMaster, &ack, 1);
@@ -1173,6 +1451,8 @@ int main(int argc, char **argv)
                       && results34.value("Target Full Scale").toMap().value("reported").toString() == QStringLiteral("50")
                       && results32.value("Calibration Full Scale").toMap().value("reported").toString() == QStringLiteral("1000")
                       && results34.value("Calibration Full Scale").toMap().value("reported").toString() == QStringLiteral("50")
+                      && results32.value("RS485 Address").toMap().value("status").toString() == QStringLiteral("MATCH")
+                      && results34.value("RS485 Address").toMap().value("status").toString() == QStringLiteral("MATCH")
                       && joinedAttributionTrace.contains(QStringLiteral("REQUEST_ADDRESS=32 PENDING_ADDRESS=32 STATE_DESTINATION_ADDRESS=32 RESPONSE_ADDRESS=0x00"))
                       && joinedAttributionTrace.contains(QStringLiteral("REQUEST_ADDRESS=34 PENDING_ADDRESS=34 STATE_DESTINATION_ADDRESS=34 RESPONSE_ADDRESS=0x00")),
                       "response Address=0x00 时 metadata 只能更新 pending request 对应的设备状态");
@@ -1229,7 +1509,7 @@ int main(int argc, char **argv)
                 else if (commandClass == 0x66 && attribute == 0x07) data = QByteArray::fromHex("0800");
                 else if (commandClass == 0x66 && attribute == 0x08) data = QByteArray::fromHex("E803");
                 else if (commandClass == 0x66 && attribute == 0x04) data = QByteArray::fromHex("00000100");
-                else if (commandClass == 0x03 && attribute == 0x01) data = QByteArray::fromHex("2000");
+                else if (commandClass == 0x03 && attribute == 0x01) data = QByteArray::fromHex("20");
                 else if (commandClass == 0x03 && attribute == 0x02) data = QByteArray::fromHex("004B");
                 const char ack = char(MfcProtocol::Ack);
                 (void)::write(metadataPtyMaster, &ack, 1);

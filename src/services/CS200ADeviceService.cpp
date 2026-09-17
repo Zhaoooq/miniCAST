@@ -40,28 +40,41 @@ CS200ADeviceService::CS200ADeviceService(int interval, double warning, double cr
 
 CS200ADeviceService::~CS200ADeviceService()
 {
+    requestTransactionCancellation(SerialTransport::CancelReason::ApplicationShutdown);
     disconnectDevice();
     const std::lock_guard<std::mutex> lock(m_managerLifetimeMutex);
     m_manager.reset();
 }
 
-void CS200ADeviceService::requestTransactionCancellation() noexcept
+void CS200ADeviceService::requestTransactionCancellation(SerialTransport::CancelReason reason) noexcept
 {
+    if (reason == SerialTransport::CancelReason::MonitoringStop
+        || reason == SerialTransport::CancelReason::DeviceDisconnect
+        || reason == SerialTransport::CancelReason::ApplicationShutdown
+        || reason == SerialTransport::CancelReason::ExperimentStop)
+        m_lifecycleCancellationRequested.store(true);
     const std::lock_guard<std::mutex> lock(m_managerLifetimeMutex);
-    if (m_manager) m_manager->cancelCurrentTransaction();
+    if (m_manager) m_manager->cancelCurrentTransaction(reason);
+}
+
+void CS200ADeviceService::reserveDeviceInfoScan() noexcept
+{
+    // This is safe from the GUI thread.  The actual timer changes and all
+    // serial work remain on the service/serial thread.
+    m_deviceInfoScanReserved.store(true);
 }
 
 void CS200ADeviceService::requestExperimentStop() noexcept
 {
     m_experimentStopRequested.store(true);
-    requestTransactionCancellation();
+    requestTransactionCancellation(SerialTransport::CancelReason::ExperimentStop);
 }
 
 void CS200ADeviceService::recoverCommunicationFromWatchdog()
 {
     if ((!m_monitoring && !m_experiment.active()) || !m_manager) return;
     m_manager->setMonitoringActive(true);
-    m_log.write(QStringLiteral("COMMUNICATION_WORKER_RECOVERED parser reset; READ_ONLY polling continues"));
+    m_log.write(QStringLiteral("[Startup] WORKER_RESET context=WATCHDOG parser_reset=true READ_ONLY polling continues"));
 }
 
 void CS200ADeviceService::setOperationState(const QString &state)
@@ -69,6 +82,52 @@ void CS200ADeviceService::setOperationState(const QString &state)
     if (m_operationState == state) return;
     m_operationState = state;
     emit deviceInfoChanged(deviceInfo());
+}
+
+void CS200ADeviceService::beginDeviceInfoScan(const QString &origin)
+{
+    m_deviceInfoScanReserved.store(true);
+    m_deviceInfoScanActive.store(true);
+    // QTimer callbacks and the scan are serialized by this worker thread, so
+    // stopping both schedulers here lets any already-running READ_FLOW finish
+    // normally before this queued mode switch begins.  No transaction is
+    // cancelled to enter DeviceInfo mode.
+    m_resumePollingAfterDeviceInfo = m_monitoring && m_pollTimer->isActive();
+    m_resumeRecoveryAfterDeviceInfo = m_recoveryTimer->isActive();
+    m_pollTimer->stop();
+    m_recoveryTimer->stop();
+    m_waitingForPostDeviceInfoReadFlow.store(m_resumePollingAfterDeviceInfo);
+    m_log.write(QStringLiteral("[Startup/DeviceInfo] DEVICE_INFO_BEGIN origin=%1").arg(origin));
+    m_log.write(QStringLiteral("[Polling] PAUSE reason=DEVICE_INFO_BEGIN"));
+    m_log.write(QStringLiteral("[Watchdog] DISARM reason=DEVICE_INFO_BEGIN"));
+}
+
+void CS200ADeviceService::finishDeviceInfoScan(const QString &origin, bool success)
+{
+    m_deviceInfoScanActive.store(false);
+    m_deviceInfoScanReserved.store(false);
+    const int failedCount = m_manager ? m_manager->lastDeviceInfoFailedCount() : 0;
+    const int retryRecoveredCount = m_manager ? m_manager->lastDeviceInfoRetryRecoveredCount() : 0;
+    m_log.write(QStringLiteral("[Startup/DeviceInfo] DEVICE_INFO_ALL_COMPLETE origin=%1 result=%2 failed_count=%3 retry_recovered_count=%4")
+        .arg(origin, success ? QStringLiteral("SUCCESS") : QStringLiteral("FAILED"))
+        .arg(failedCount).arg(retryRecoveredCount));
+
+    const bool resume = m_resumePollingAfterDeviceInfo && m_monitoring
+        && !m_lifecycleCancellationRequested.load() && m_manager && m_manager->isConnected();
+    if (resume) {
+        m_log.write(QStringLiteral("[Polling] RESUME reason=DEVICE_INFO_COMPLETE"));
+        m_log.write(QStringLiteral("[Watchdog] WAIT_FIRST_READ_FLOW"));
+        if (!m_pollTimer->isActive()) m_pollTimer->start();
+        if (m_resumeRecoveryAfterDeviceInfo && !m_recoveryTimer->isActive()) m_recoveryTimer->start();
+    } else {
+        // There will be no post-scan poll when stop/disconnect/shutdown won
+        // the race.  Do not retain a stale watchdog suspension in that case.
+        m_waitingForPostDeviceInfoReadFlow.store(false);
+    }
+    m_resumePollingAfterDeviceInfo = false;
+    m_resumeRecoveryAfterDeviceInfo = false;
+    emit deviceInfoScanFinished();
+    if (resume) poll();
 }
 
 void CS200ADeviceService::setLogDirectory(const QString &directory)
@@ -259,7 +318,7 @@ void CS200ADeviceService::connectDevice()
 {
     if (m_manager && m_manager->isConnected()) return;
     setStatus(DeviceStatus::Scanning);
-    m_log.write(QStringLiteral("BUS SCAN start configured_devices=%1 baud=%2")
+    m_log.write(QStringLiteral("[Startup] CONNECT_BEGIN configured_devices=%1 baud=%2")
                 .arg(m_configs.size()).arg(m_settings.baudRate));
     {
         const std::lock_guard<std::mutex> lock(m_managerLifetimeMutex);
@@ -295,7 +354,8 @@ void CS200ADeviceService::connectDevice()
 
 void CS200ADeviceService::disconnectDevice()
 {
-    requestTransactionCancellation();
+    requestTransactionCancellation(SerialTransport::CancelReason::DeviceDisconnect);
+    m_log.write(QStringLiteral("[transport] CANCELLATION_REQUESTED reason=DEVICE_DISCONNECT context=DISCONNECT_DEVICE"));
     m_pollTimer->stop();
     m_recoveryTimer->stop();
     m_reconnectTimer->stop();
@@ -346,8 +406,10 @@ void CS200ADeviceService::startMonitoring()
         emit communicationError(QStringLiteral("启动失败：串口已连接，但未发现可通信的 MFC"));
         return;
     }
+    m_lifecycleCancellationRequested.store(false);
     m_monitoring = true;
     m_manager->setMonitoringActive(true);
+    m_log.write(QStringLiteral("[Startup] READ_FLOW_START poll_interval_ms=%1").arg(m_pollTimer->interval()));
     setOperationState(QStringLiteral("READ_ONLY"));
     setStatus(DeviceStatus::Monitoring);
     emit monitoringActiveChanged(true);
@@ -359,7 +421,8 @@ void CS200ADeviceService::startMonitoring()
 void CS200ADeviceService::stopMonitoring()
 {
     if (m_controlSession) { stopControl(); return; }
-    requestTransactionCancellation();
+    requestTransactionCancellation(SerialTransport::CancelReason::MonitoringStop);
+    m_log.write(QStringLiteral("[transport] CANCELLATION_REQUESTED reason=MONITORING_STOP context=STOP_MONITORING"));
     setOperationState(QStringLiteral("STOPPING"));
     m_pollTimer->stop();
     // Keep address recovery alive while the port remains open.  Stopping
@@ -389,14 +452,21 @@ void CS200ADeviceService::selectOperatingPoint(const OperatingPoint &point)
 void CS200ADeviceService::startControl(const OperatingPoint &point)
 {
     if (!point.hasValidFlowValues()) { emit communicationError(QStringLiteral("运行点目标流量数据无效")); return; }
-    if (!m_manager || !m_manager->isConnected()) { emit communicationError(QStringLiteral("开始控制失败：串口未连接")); return; }
+    if (!m_manager || !m_manager->isConnected()) {
+        m_deviceInfoScanReserved.store(false);
+        emit deviceInfoScanFinished();
+        emit communicationError(QStringLiteral("开始控制失败：串口未连接")); return;
+    }
     m_targetFlows = point.mfcSetpoints;
     m_configuredTargetFlows = point.mfcSetpoints;
     m_activeOperatingPointId = point.id;
     setOperationState(QStringLiteral("PREPARING_CONTROL"));
+    beginDeviceInfoScan(QStringLiteral("CONTROL_PREFLIGHT"));
     QString error;
     bool writesStarted = false;
-    if (!m_manager->applyOperatingPoint(m_targetFlows, &error, &writesStarted)) {
+    const bool applied = m_manager->applyOperatingPoint(m_targetFlows, &error, &writesStarted);
+    finishDeviceInfoScan(QStringLiteral("CONTROL_PREFLIGHT"), applied);
+    if (!applied) {
         // A metadata preflight failure happens before Current CM/Hold/
         // Setpoint/Follow writes. It is not a control session and must not
         // present the UI as running or offer a misleading Stop Control.
@@ -441,15 +511,21 @@ void CS200ADeviceService::stopControl()
 void CS200ADeviceService::verifyDeviceInformation()
 {
     if (!m_manager || !m_manager->isConnected()) {
+        m_deviceInfoScanReserved.store(false);
+        emit deviceInfoScanFinished();
         emit communicationError(QStringLiteral("设备信息核验失败：串口未连接"));
         return;
     }
     if (m_controlSession) {
+        m_deviceInfoScanReserved.store(false);
+        emit deviceInfoScanFinished();
         emit communicationError(QStringLiteral("控制会话期间不能执行设备信息核验；请先停止控制"));
         return;
     }
+    beginDeviceInfoScan(QStringLiteral("MANUAL_VERIFY"));
     QString error;
     const bool ok = m_manager->verifyDeviceInformation(&error);
+    finishDeviceInfoScan(QStringLiteral("MANUAL_VERIFY"), ok);
     rebuildChannels();
     emit deviceInfoChanged(deviceInfo());
     emit flowDataUpdated(m_channels);
@@ -460,17 +536,23 @@ void CS200ADeviceService::verifyDeviceInformation()
 void CS200ADeviceService::runFullScaleDiagnostics()
 {
     if (!m_manager || !m_manager->isConnected()) {
+        m_deviceInfoScanReserved.store(false);
+        emit deviceInfoScanFinished();
         emit communicationError(QStringLiteral("Full Scale 诊断失败：串口未连接"));
         emit fullScaleDiagnosticsFinished();
         return;
     }
     if (m_controlSession) {
+        m_deviceInfoScanReserved.store(false);
+        emit deviceInfoScanFinished();
         emit communicationError(QStringLiteral("控制会话期间不能执行 Full Scale 诊断；请先停止控制"));
         emit fullScaleDiagnosticsFinished();
         return;
     }
+    beginDeviceInfoScan(QStringLiteral("FULL_SCALE_DIAGNOSTICS"));
     QString error;
     const bool ok = m_manager->runFullScaleDiagnostics(&error);
+    finishDeviceInfoScan(QStringLiteral("FULL_SCALE_DIAGNOSTICS"), ok);
     rebuildChannels();
     emit deviceInfoChanged(deviceInfo());
     emit flowDataUpdated(m_channels);
@@ -481,7 +563,7 @@ void CS200ADeviceService::runFullScaleDiagnostics()
 
 void CS200ADeviceService::poll()
 {
-    if (!m_monitoring || !m_manager || !m_manager->isConnected()) return;
+    if (!m_monitoring || m_deviceInfoScanActive.load() || !m_manager || !m_manager->isConnected()) return;
     QString error;
     const bool ok = m_manager->pollNext(&error);
     rebuildChannels();
@@ -503,6 +585,13 @@ void CS200ADeviceService::poll()
     else setStatus(DeviceStatus::Monitoring);
     emit deviceInfoChanged(deviceInfo());
     emit flowDataUpdated(m_channels);
+    if (ok) {
+        if (m_waitingForPostDeviceInfoReadFlow.exchange(false))
+            m_log.write(QStringLiteral("[Polling] READ_FLOW_SUCCESS phase=POST_DEVICEINFO"));
+        else
+            m_log.write(QStringLiteral("[Polling] READ_FLOW_SUCCESS"));
+        emit readFlowSucceeded();
+    }
     Q_UNUSED(ok)
     // A single READ_FLOW error is retained in the address-specific debug log
     // and never becomes a user-facing notification.  updateCommunicationNotice()

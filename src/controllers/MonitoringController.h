@@ -38,6 +38,18 @@ public:
     int deviceStatusCode() const { return static_cast<int>(m_deviceStatus); }
     int flameStatusCode() const { return static_cast<int>(m_flameStatus); }
     QVariantMap deviceInfo() const { return m_deviceInfo; }
+    // The monitoring watchdog protects the polling worker, not bootstrap
+    // metadata reads.  A completed READ_FLOW is the boundary at which the
+    // polling worker is known to be running.
+    static bool shouldArmMonitoringWatchdog(bool monitoringActive,
+                                            bool readFlowObserved) noexcept {
+        return monitoringActive && readFlowObserved;
+    }
+    static bool shouldArmMonitoringWatchdog(bool monitoringActive,
+                                            bool deviceInfoScanOrResumePending,
+                                            bool readFlowObserved) noexcept {
+        return monitoringActive && !deviceInfoScanOrResumePending && readFlowObserved;
+    }
     void selectOperatingPoint(const OperatingPoint &point);
     void setLogDirectory(const QString &directory);
     void setAddressConfirmed(int address, bool confirmed);
@@ -68,13 +80,18 @@ private slots:
     void onFlameStatus(FlameStatus status);
     void onDeviceInfo(const QVariantMap &info);
     void onMonitoringActive(bool active);
+    void onReadFlowSucceeded();
+    void onDeviceInfoScanFinished();
 private:
+    void disarmMonitoringWatchdogForDeviceInfo();
     QThread m_deviceThread;
     QTimer m_communicationWatchdog;
     QTimer m_guiHeartbeat;
     QElapsedTimer m_lastGuiHeartbeat;
     QElapsedTimer m_lastCommunicationProgress;
     quint64 m_lastFinishedRequestId{0};
+    bool m_monitoringWatchdogArmed{false};
+    bool m_waitingForPostDeviceInfoReadFlow{false};
     IDeviceService *m_service;
     QList<GasChannel> m_channels;
     QVariantMap m_deviceInfo;

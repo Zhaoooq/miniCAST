@@ -28,6 +28,10 @@ public:
         // This is intentionally independent from READ_FLOW scheduling.
         int metadataInterRequestDelayMs{20};
         int freshnessTimeoutMs{3000};
+        // A successful operator DeviceInfo verification should remain useful
+        // long enough for the following Start Control click.  This is kept
+        // separate from READ_FLOW freshness.
+        int verificationSnapshotMaxAgeMs{15000};
     };
 
     MfcManager(QList<MfcDeviceConfig> devices, Settings settings,
@@ -44,7 +48,10 @@ public:
     bool allEnabledDevicesOffline() const;
     QString communicationNotice() const;
     void setMonitoringActive(bool active);
-    void cancelCurrentTransaction() noexcept { m_transport.requestCancel(); }
+    void cancelCurrentTransaction(SerialTransport::CancelReason reason =
+                                      SerialTransport::CancelReason::Unspecified) noexcept {
+        m_transport.requestCancel(reason);
+    }
     bool setAddressConfirmed(int address, bool confirmed);
     bool pollNext(QString *errorMessage = nullptr);
     // Poll exactly one non-normal address when its retry deadline is due.
@@ -69,6 +76,9 @@ public:
     // Read-only maintenance transaction.  It deliberately shares the same
     // transport and therefore cannot race a flow/control request.
     bool verifyDeviceInformation(QString *errorMessage = nullptr);
+    bool hasValidVerificationSnapshot() const;
+    int lastDeviceInfoFailedCount() const { return m_lastDeviceInfoFailedCount; }
+    int lastDeviceInfoRetryRecoveredCount() const { return m_lastDeviceInfoRetryRecoveredCount; }
     // Read-only isolation experiment: ten Target Full Scale samples per
     // configured address followed by 32/34 alternating samples.  It does
     // not touch Preflight, address confirmation, control state or EEPROM.
@@ -100,4 +110,25 @@ private:
                                       bool includeCalibration = false);
     static double fullScaleSccm(const MfcDeviceConfig &config);
     void setControlState(MfcControlState state);
+    // DeviceInfo is an identity/control-safety transaction, not a caller
+    // tunable "best effort" read.  Every origin therefore gets exactly two
+    // attempts, even if legacy READ_FLOW retryCount is configured as zero.
+    int deviceInfoMaxRetries() const { return 1; }
+    QString deviceConfigurationRevision() const;
+    void clearDeviceInfoState(MfcDeviceState &state);
+    void invalidateVerificationSnapshot(const QString &reason);
+    void saveVerificationSnapshot();
+    struct VerificationSnapshot {
+        bool valid{false};
+        quint64 connectionGeneration{0};
+        QString portIdentity;
+        QString configurationRevision;
+        QList<quint8> enabledAddresses;
+        QMap<quint8, QString> identities;
+        QDateTime verifiedAt;
+    };
+    VerificationSnapshot m_verificationSnapshot;
+    quint64 m_connectionGeneration{0};
+    int m_lastDeviceInfoFailedCount{0};
+    int m_lastDeviceInfoRetryRecoveredCount{0};
 };
