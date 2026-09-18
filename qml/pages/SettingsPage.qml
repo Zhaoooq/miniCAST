@@ -9,9 +9,8 @@ Item {
     id: root
     signal operatingPointsRequested()
     property int selectedCategory: 0
-    property var categories: ["系统设置", "运行点管理", "设备设置", "显示设置", "数据管理", "维护 / 通信诊断", "关于软件"]
+    property var categories: ["系统设置", "运行点管理", "设备设置", "显示设置", "数据管理", "关于软件"]
     property int pendingConfirmAddress: -1
-    property bool diagnosticsDialogPending: false
 
     // Both the device page and the read-only dialogs consume the immutable
     // snapshot exposed by AppController.deviceInfo.devices.  In particular,
@@ -28,40 +27,6 @@ Item {
         var status = result.statusText || "读取失败"
         return result.error ? status + "：" + result.error : status
     }
-    function diagnosticSampleValue(sample) {
-        return sample.value !== undefined ? String(sample.value) : "失败"
-    }
-    function diagnosticsPendingStatus(samples) {
-        if (!samples || samples.length === 0) return "未执行"
-        for (var i = 0; i < samples.length; ++i) {
-            var sample = samples[i]
-            if (sample.pendingAddress !== undefined
-                    && sample.destinationStateAddress !== undefined
-                    && sample.pendingAddress !== sample.destinationStateAddress)
-                return "异常"
-        }
-        return "正常"
-    }
-    function diagnosticsStaleStatus(samples) {
-        if (!samples || samples.length === 0) return "未执行"
-        for (var i = 0; i < samples.length; ++i) {
-            var sample = samples[i]
-            if (Number(sample.staleRxBefore || 0) > 0 || Number(sample.staleRxAfter || 0) > 0)
-                return "发现"
-        }
-        return "未发现"
-    }
-
-    Connections {
-        target: appController
-        function onFullScaleDiagnosticsRunningChanged() {
-            if (!appController.fullScaleDiagnosticsRunning && root.diagnosticsDialogPending) {
-                root.diagnosticsDialogPending = false
-                diagnosticsDialog.open()
-            }
-        }
-    }
-
     FolderDialog {
         id: dataFolderDialog
         title: "选择数据保存目录"
@@ -207,7 +172,7 @@ Item {
                 }
                 Loader {
                     Layout.fillWidth: true; Layout.fillHeight: true
-                    sourceComponent: [systemPane, pointsPane, devicePane, displayPane, dataPane, diagnosticPane, aboutPane][root.selectedCategory]
+                    sourceComponent: [systemPane, pointsPane, devicePane, displayPane, dataPane, aboutPane][root.selectedCategory]
                 }
             }
         }
@@ -350,44 +315,6 @@ Item {
         footer: Item { implicitHeight: 44; HmiButton { anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: "关闭"; implicitWidth: 80; onClicked: verificationDialog.close() } }
     }
 
-    Dialog {
-        id: diagnosticsDialog
-        modal: true
-        anchors.centerIn: Overlay.overlay
-        width: Math.min(620, Overlay.overlay.width - 24)
-        height: Math.min(410, Overlay.overlay.height - 24)
-        padding: 12
-        title: "量程隔离诊断结果"
-        background: Rectangle { color: Theme.surface; border.color: Theme.border; radius: Theme.radius }
-        contentItem: ScrollView {
-            clip: true
-            contentWidth: availableWidth
-            Column {
-                width: parent.width; spacing: 8
-                Repeater {
-                    model: appController.deviceInfo.devices || []
-                    delegate: Rectangle {
-                        required property var modelData
-                        readonly property var diagnostic: modelData.metadataDiagnostics || ({})
-                        readonly property var samples: diagnostic.targetFullScaleSamples || []
-                        readonly property var interleaved: diagnostic.interleaved32_34Samples || []
-                        width: parent.width; height: modelData.protocolAddress === 32 && interleaved.length > 0 ? 132 : 94
-                        radius: 4; color: Theme.secondaryBackground; border.color: Theme.border
-                        Column {
-                            anchors.fill: parent; anchors.margins: 8; spacing: 3
-                            Text { text: modelData.displayName + " · Address " + modelData.protocolAddress; color: Theme.textPrimary; font.pixelSize: 12; font.weight: Font.DemiBold }
-                            Text { text: samples.length ? "Target FS ×10：" + samples.map(function(sample) { return root.diagnosticSampleValue(sample) }).join("  ") : "尚未执行量程隔离诊断"; color: Theme.textPrimary; font.pixelSize: 10; wrapMode: Text.Wrap; width: parent.width }
-                            Text { visible: samples.length > 0; text: "稳定性：" + (diagnostic.targetFullScaleConsistent ? "稳定" : "不稳定") + " · Pending归属：" + root.diagnosticsPendingStatus(samples) + " · Stale RX：" + root.diagnosticsStaleStatus(samples); color: diagnostic.targetFullScaleConsistent ? Theme.green : Theme.yellow; font.pixelSize: 10 }
-                            Text { visible: modelData.protocolAddress === 32 && interleaved.length > 0; text: "32 / 34 交错读取：" + interleaved.map(function(sample) { return (sample.destinationStateAddress || "?") + " → " + root.diagnosticSampleValue(sample) }).join("   "); color: Theme.textSecondary; font.pixelSize: 10; wrapMode: Text.Wrap; width: parent.width }
-                            Text { visible: modelData.protocolAddress === 32 && interleaved.length > 0; text: "交错 Pending归属：" + root.diagnosticsPendingStatus(interleaved) + " · Stale RX：" + root.diagnosticsStaleStatus(interleaved); color: Theme.textSecondary; font.pixelSize: 10 }
-                        }
-                    }
-                }
-            }
-        }
-        footer: Item { implicitHeight: 44; HmiButton { anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: "关闭"; implicitWidth: 80; onClicked: diagnosticsDialog.close() } }
-    }
-
     Component {
         id: pointsPane
         ColumnLayout {
@@ -498,17 +425,8 @@ Item {
                 RowLayout {
                     Layout.fillWidth: true; Layout.preferredHeight: 70; Layout.leftMargin: 10; Layout.rightMargin: 8
                     Text { Layout.fillWidth: true; text: "设备信息核验仅读取设备报告，不会修改气体、量程、地址或 EEPROM。"; color: Theme.textSecondary; font.pixelSize: 10; wrapMode: Text.Wrap }
-                    HmiButton { text: "设备信息核验"; implicitWidth: 104; implicitHeight: 44; enabled: !appController.controlling && !appController.fullScaleDiagnosticsRunning; onClicked: { appController.verifyDeviceInformation(); verificationDialog.open() } }
-                    HmiButton {
-                        text: appController.fullScaleDiagnosticsRunning ? "诊断中…" : "量程隔离诊断"
-                        implicitWidth: 104; implicitHeight: 44
-                        enabled: !appController.controlling && !appController.fullScaleDiagnosticsRunning
-                        onClicked: {
-                            root.diagnosticsDialogPending = true
-                            appController.runFullScaleDiagnostics()
-                        }
-                    }
-                    HmiButton { text: "重新扫描"; primary: true; implicitWidth: 92; implicitHeight: 44; enabled: !appController.fullScaleDiagnosticsRunning; onClicked: appController.rescanMfc() }
+                    HmiButton { text: "设备信息核验"; implicitWidth: 104; implicitHeight: 44; enabled: !appController.controlling; onClicked: { appController.verifyDeviceInformation(); verificationDialog.open() } }
+                    HmiButton { text: "重新扫描"; primary: true; implicitWidth: 92; implicitHeight: 44; enabled: true; onClicked: appController.rescanMfc() }
                 }
             }
         }
@@ -563,121 +481,6 @@ Item {
                 HmiButton { text: "导出报警 CSV"; Layout.fillWidth: true; implicitHeight: 44; primary: true; onClicked: appController.exportAlarms() }
             }
             Item { Layout.fillHeight: true }
-        }
-    }
-
-    Component {
-        id: diagnosticPane
-        Item {
-            property var experiment: appController.communicationExperiment || ({})
-            property var totals: experiment.global || ({})
-            ColumnLayout {
-                anchors.fill: parent; anchors.margins: 8; spacing: 5
-                Rectangle {
-                    Layout.fillWidth: true; Layout.preferredHeight: 42; radius: 3
-                    color: experiment.active ? "#FFF8E9" : Theme.secondaryBackground
-                    border.color: experiment.active ? Theme.yellow : Theme.border
-                    RowLayout {
-                        anchors.fill: parent; anchors.margins: 8; spacing: 8
-                        ColumnLayout { Layout.fillWidth: true; spacing: 0
-                            Text { Layout.fillWidth: true; text: "CS200 通信实验 · 严格只读"; color: Theme.textPrimary; font.pixelSize: 13; font.weight: Font.Bold }
-                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "仅 READ_FLOW · Service 0x80 / Class 0x68 / Instance 0x01 / Attribute 0xB9"; color: Theme.textSecondary; font.pixelSize: 9 }
-                        }
-                        HmiToggle { checked: true; enabled: false; text: "仅 READ_FLOW"; implicitWidth: 112; implicitHeight: 28 }
-                        Text {
-                            text: experiment.active ? ("运行中 · 剩余 " + (experiment.remainingSeconds || 0) + " s") : "已停止"
-                            color: experiment.active ? Theme.yellow : Theme.textSecondary; font.pixelSize: 11; font.weight: Font.DemiBold
-                        }
-                    }
-                }
-                RowLayout {
-                    Layout.fillWidth: true; Layout.preferredHeight: 43; spacing: 7
-                    Text { text: "设备"; color: Theme.textSecondary; font.pixelSize: 10 }
-                    HmiComboBox {
-                        id: experimentDevice
-                        model: ["全部 32/33/34/35/36", "仅地址 32", "仅地址 33", "仅地址 34", "仅地址 35", "仅地址 36"]
-                        property var values: [0, 32, 33, 34, 35, 36]
-                        implicitWidth: 168; implicitHeight: 31; font.pixelSize: 10; enabled: !experiment.active
-                        onCurrentIndexChanged: experimentDuration.currentIndex = currentIndex === 0 ? 1 : 0
-                        Component.onCompleted: experimentDuration.currentIndex = 1
-                    }
-                    Item { Layout.fillWidth: true }
-                    Text { text: "间隔"; color: Theme.textSecondary; font.pixelSize: 10 }
-                    HmiComboBox {
-                        id: experimentDelay; model: ["200 ms（固定）"]
-                        property var values: [200]
-                        implicitWidth: 86; implicitHeight: 31; font.pixelSize: 10; enabled: !experiment.active
-                    }
-                    Text { text: "时长"; color: Theme.textSecondary; font.pixelSize: 10 }
-                    HmiComboBox {
-                        id: experimentDuration; model: ["5 分钟", "10 分钟"]
-                        property var values: [300, 600]
-                        implicitWidth: 91; implicitHeight: 31; font.pixelSize: 10; enabled: !experiment.active
-                    }
-                    HmiButton {
-                        text: "开始实验"; primary: true; implicitWidth: 76; implicitHeight: 33; font.pixelSize: 10
-                        enabled: !appController.monitoring && !experiment.active
-                        onClicked: appController.startCommunicationExperiment(experimentDelay.values[experimentDelay.currentIndex], experimentDuration.values[experimentDuration.currentIndex], experimentDevice.values[experimentDevice.currentIndex])
-                    }
-                    HmiButton {
-                        text: "停止"; danger: true; implicitWidth: 56; implicitHeight: 33; font.pixelSize: 10
-                        enabled: experiment.active; onClicked: appController.stopCommunicationExperiment()
-                    }
-                }
-                Rectangle {
-                    Layout.fillWidth: true; Layout.preferredHeight: 37; color: Theme.secondaryBackground; border.color: Theme.border; radius: 2
-                    RowLayout { anchors.fill: parent; anchors.margins: 7; spacing: 14
-                        Text { text: "请求 " + (totals.requestCount || 0); color: Theme.textPrimary; font.pixelSize: 10 }
-                        Text { text: "成功 " + (totals.requestSuccess || 0); color: Theme.green; font.pixelSize: 10 }
-                        Text { text: "最终失败 " + (totals.requestFinalFailure || 0) + "  (" + Number(totals.finalFailureRate || 0).toFixed(2) + "%)"; color: (totals.requestFinalFailure || 0) > 0 ? Theme.red : Theme.textPrimary; font.pixelSize: 10 }
-                        Text { text: "Attempts " + (totals.attemptCount || 0) + " / Retry恢复 " + (totals.retrySuccess || 0); color: Theme.textPrimary; font.pixelSize: 10 }
-                        Text { Layout.fillWidth: true; horizontalAlignment: Text.AlignRight; text: "配置 " + (experiment.delayMs || 100) + " ms / 实测 FINISH→TX 均值 " + Number(totals.actualAverageTransactionGapMs || 0).toFixed(1) + " ms"; color: Theme.primary; font.pixelSize: 10; font.weight: Font.DemiBold }
-                    }
-                }
-                Rectangle {
-                    Layout.fillWidth: true; Layout.preferredHeight: 25; color: Theme.tableHeader
-                    Row {
-                        anchors.fill: parent
-                        Repeater {
-                            model: [{t:"地址",w:42},{t:"请求",w:50},{t:"成功",w:50},{t:"终败",w:48},{t:"Attempts",w:58},{t:"校验",w:48},{t:"协议",w:48},{t:"Retry恢复",w:60},{t:"Avg",w:52},{t:"P95",w:52},{t:"Max",w:52}]
-                            delegate: Text { required property var modelData; width: modelData.w; height: parent.height; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter; text: modelData.t; color: Theme.textSecondary; font.pixelSize: 9; font.weight: Font.DemiBold }
-                        }
-                    }
-                }
-                Repeater {
-                    model: experiment.addressStats || []
-                    delegate: Rectangle {
-                        required property var modelData
-                        required property int index
-                        Layout.fillWidth: true; Layout.preferredHeight: 27; color: index % 2 ? Theme.secondaryBackground : "white"
-                        Row {
-                            anchors.fill: parent
-                            Text { width: 42; height: parent.height; text: modelData.address; color: Theme.textPrimary; font.pixelSize: 10; font.weight: Font.Bold; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                            Text { width: 50; height: parent.height; text: modelData.requestCount || 0; color: Theme.textPrimary; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                            Text { width: 50; height: parent.height; text: modelData.requestSuccess || 0; color: Theme.green; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                            Text { width: 48; height: parent.height; text: modelData.requestFinalFailure || 0; color: (modelData.requestFinalFailure || 0) ? Theme.red : Theme.textPrimary; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                            Text { width: 58; height: parent.height; text: modelData.attemptCount || 0; color: Theme.textPrimary; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                            Text { width: 48; height: parent.height; text: modelData.attemptChecksumError || 0; color: (modelData.attemptChecksumError || 0) ? Theme.red : Theme.textPrimary; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                            Text { width: 48; height: parent.height; text: modelData.attemptProtocolError || 0; color: (modelData.attemptProtocolError || 0) ? Theme.red : Theme.textPrimary; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                            Text { width: 60; height: parent.height; text: modelData.retrySuccess || 0; color: Theme.primary; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                            Text { width: 52; height: parent.height; text: Number(modelData.avgResponseMs || 0).toFixed(1); color: Theme.textPrimary; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                            Text { width: 52; height: parent.height; text: Number(modelData.p95ResponseMs || 0).toFixed(1); color: Theme.textPrimary; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                            Text { width: 52; height: parent.height; text: Number(modelData.maxResponseMs || 0).toFixed(0); color: Theme.textPrimary; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                        }
-                    }
-                }
-                Text {
-                    Layout.fillWidth: true
-                    text: "Attempt 超时 " + (totals.attemptTimeout || 0) + "；stale RX " + (totals.lateRxAfterFinishCount || 0) + "；PRE-TX RX " + (totals.preTxRxBytesCount || 0) + "；partial " + (totals.preTxPartialStateCount || 0) + "；GUI stall " + (totals.guiHeartbeatStalls || 0)
-                    color: Theme.textSecondary; font.pixelSize: 9
-                }
-                Text {
-                    Layout.fillWidth: true; elide: Text.ElideMiddle
-                    text: experiment.jsonReportPath ? ("报告：" + experiment.jsonReportPath) : "实验结束后自动导出 JSON 与同名 Markdown"
-                    color: experiment.jsonReportPath ? Theme.green : Theme.textSecondary; font.pixelSize: 9
-                }
-                Item { Layout.fillHeight: true }
-            }
         }
     }
 

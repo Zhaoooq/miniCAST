@@ -2,6 +2,38 @@
 #include "services/CS200ADeviceService.h"
 #include <QMetaObject>
 
+namespace {
+QList<GasChannel> initialChannels(const QList<MfcDeviceConfig> &devices)
+{
+    QList<GasChannel> channels;
+    channels.reserve(devices.size());
+    for (const auto &config : devices) {
+        if (!config.enabled) continue;
+
+        GasChannel channel;
+        channel.id = config.stableId();
+        channel.address = config.address;
+        channel.nameChinese = config.displayName.isEmpty()
+            ? QStringLiteral("MFC %1").arg(config.logicalChannel) : config.displayName;
+        channel.chemicalName = config.gasType == QStringLiteral("待确认") ? QString() : config.gasType;
+        channel.gasType = config.gasType;
+        channel.function = config.function;
+        channel.minimum = config.minimumSetpoint;
+        channel.tolerancePercent = config.relativeTolerancePercent;
+        channel.addressConfirmed = config.addressConfirmed;
+        channel.online = false;
+        channel.status = FlowStatus::Offline;
+        channel.communicationState = QStringLiteral("正在确认通信");
+        channel.communicationStateCode = 0;
+        channel.configurationState = QStringLiteral("正在确认设备通信");
+        channel.deviationAvailable = false;
+        channel.waitingForActualFlow = true;
+        channels.append(channel);
+    }
+    return channels;
+}
+}
+
 MonitoringController::MonitoringController(int interval, double warning, double critical,
                                            double zeroTolerance, QObject *parent,
                                            const QString &logDirectory,
@@ -13,6 +45,11 @@ MonitoringController::MonitoringController(int interval, double warning, double 
                                            int metadataInterRequestDelayMs)
     : QObject(parent)
 {
+    // Populate the dashboard before the first serial response arrives.  These
+    // are identity/configuration placeholders only; live flow fields stay
+    // unavailable until CS200 READ_FLOW succeeds.
+    m_channels = initialChannels(devices);
+
     MfcManager::Settings settings;
         settings.serialPort = serialPort;
         settings.baudRate = preferredBaud;
@@ -37,9 +74,6 @@ MonitoringController::MonitoringController(int interval, double warning, double 
     connect(m_service, &IDeviceService::deviceInfoChanged, this, &MonitoringController::onDeviceInfo);
     connect(m_service, &IDeviceService::monitoringActiveChanged,
             this, &MonitoringController::onMonitoringActive);
-    connect(qobject_cast<CS200ADeviceService *>(m_service),
-            &CS200ADeviceService::fullScaleDiagnosticsFinished,
-            this, &MonitoringController::fullScaleDiagnosticsFinished);
     connect(qobject_cast<CS200ADeviceService *>(m_service),
             &CS200ADeviceService::readFlowSucceeded,
             this, &MonitoringController::onReadFlowSucceeded);
@@ -174,32 +208,6 @@ void MonitoringController::setAddressConfirmed(int address, bool confirmed)
         }, Qt::QueuedConnection);
 }
 
-void MonitoringController::startCommunicationExperiment(int delayMs, int durationSeconds,
-                                                          int selectedAddress)
-{
-    auto *service = qobject_cast<CS200ADeviceService *>(m_service);
-    if (!service) {
-        emit errorOccurred(QStringLiteral("CS200 通信实验服务不可用"));
-        return;
-    }
-    if (m_monitoring) {
-        emit errorOccurred(QStringLiteral("请先停止常规监测，再开始 CS200 通信实验"));
-        return;
-    }
-    QMetaObject::invokeMethod(service, [service, delayMs, durationSeconds, selectedAddress] {
-        service->startCommunicationExperiment(delayMs, durationSeconds, selectedAddress);
-    }, Qt::QueuedConnection);
-}
-
-void MonitoringController::stopCommunicationExperiment()
-{
-    auto *service = qobject_cast<CS200ADeviceService *>(m_service);
-    if (!service) return;
-    service->requestExperimentStop();
-    QMetaObject::invokeMethod(service, &CS200ADeviceService::stopCommunicationExperiment,
-                              Qt::QueuedConnection);
-}
-
 void MonitoringController::startControl(const OperatingPoint &point)
 {
     if (!point.hasValidFlowValues()) { emit errorOccurred(QStringLiteral("运行点目标流量数据无效")); return; }
@@ -221,14 +229,6 @@ void MonitoringController::verifyDeviceInformation()
     disarmMonitoringWatchdogForDeviceInfo();
     QMetaObject::invokeMethod(m_service, [service=m_service] {
         if (auto *cs = qobject_cast<CS200ADeviceService *>(service)) cs->verifyDeviceInformation();
-    }, Qt::QueuedConnection);
-}
-
-void MonitoringController::runFullScaleDiagnostics()
-{
-    disarmMonitoringWatchdogForDeviceInfo();
-    QMetaObject::invokeMethod(m_service, [service=m_service] {
-        if (auto *cs = qobject_cast<CS200ADeviceService *>(service)) cs->runFullScaleDiagnostics();
     }, Qt::QueuedConnection);
 }
 

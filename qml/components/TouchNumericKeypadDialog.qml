@@ -16,7 +16,7 @@ HmiDialog {
     property bool optional: false
     property var quickSteps: []
 
-    function openFor(label, value, minimum, maximum, valueUnit, allowEmpty, precision, steps) {
+    function openFor(label, value, minimum, maximum, valueUnit, allowEmpty, precision, steps, startEmpty) {
         fieldLabel = label
         unit = valueUnit || ""
         minimumValue = minimum
@@ -24,7 +24,7 @@ HmiDialog {
         optional = allowEmpty
         decimals = precision
         quickSteps = steps || []
-        inputText = value === null || value === undefined ? "" : Number(value).toFixed(decimals)
+        inputText = startEmpty ? "" : (value === null || value === undefined ? "" : Number(value).toFixed(decimals))
         title = "设置" + fieldLabel
         open()
     }

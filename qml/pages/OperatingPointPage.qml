@@ -104,7 +104,7 @@ Item {
                     HmiButton { text: "复制"; implicitWidth: 70; implicitHeight: 38; enabled: !appController.customerPointFull; onClicked: appController.duplicateOperatingPoint(root.selectedPoint.id) }
                     HmiButton { text: "删除"; danger: true; implicitWidth: 70; implicitHeight: 38; visible: !root.selectedPoint.readOnly; onClicked: { root.pendingPoint = root.selectedPoint; deleteDialog.open() } }
                     Item { Layout.fillWidth: true }
-                    HmiButton { text: appController.controlling ? "切换运行点" : "开始控制"; primary: true; implicitWidth: 132; implicitHeight: 38; enabled: !appController.controlStopping && !appController.fullScaleDiagnosticsRunning; onClicked: { root.pendingPoint = root.selectedPoint; applyDialog.open() } }
+                    HmiButton { text: appController.controlling ? "切换运行点" : "开始控制"; primary: true; implicitWidth: 132; implicitHeight: 38; enabled: !appController.controlStopping; onClicked: { root.pendingPoint = root.selectedPoint; applyDialog.open() } }
                 }
             }
         }
@@ -151,6 +151,6 @@ Item {
             editor.draft = next
         }
     }
-    ConfirmDialog { id: applyDialog; title: appController.controlling ? "切换运行点" : "开始控制"; message: appController.controlling ? "将按 Hold → 装载 → 核验 → Follow 切换运行点。" : "将预检设备配置、切换为数字模式并下发运行点。"; detail: "只允许写 Current CM、Hold/Follow、Digital Setpoint。"; acceptText: "确认"; onAccepted: { if (!appController.fullScaleDiagnosticsRunning) { appController.selectOperatingPoint(root.pendingPoint.id); appController.startControl() } } }
+    ConfirmDialog { id: applyDialog; title: appController.controlling ? "切换运行点" : "开始控制"; message: appController.controlling ? "将按 Hold → 装载 → 核验 → Follow 切换运行点。" : "将预检设备配置、切换为数字模式并下发运行点。"; detail: "只允许写 Current CM、Hold/Follow、Digital Setpoint。"; acceptText: "确认"; onAccepted: { appController.selectOperatingPoint(root.pendingPoint.id); appController.startControl() } }
     ConfirmDialog { id: deleteDialog; title: "删除客户运行点"; message: "确认删除此客户运行点？"; acceptText: "删除"; acceptDanger: true; onAccepted: { appController.deleteOperatingPoint(root.pendingPoint.id); root.selectedPoint = ({}) } }
 }

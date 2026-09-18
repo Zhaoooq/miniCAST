@@ -24,7 +24,9 @@ QtObject {
     readonly property color gaugeFill: "#660066FF"
     readonly property color gaugeTargetBand: "#1A0066FF"
     readonly property color gaugeTargetBorder: "#400066FF"
-    readonly property color targetFlow: "#F28C18"
+    // Indigo is deliberately distinct from live-flow blue, while staying in
+    // the requested cool colour family.
+    readonly property color targetFlow: "#4F46E5"
     readonly property color green: "#159564"
     readonly property color yellow: "#E58A16"
     readonly property color red: "#D83C3C"

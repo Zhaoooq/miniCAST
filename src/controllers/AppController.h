@@ -41,10 +41,8 @@ class AppController : public QObject
     Q_PROPERTY(int windowMode READ windowMode WRITE setWindowMode NOTIFY settingsChanged)
     Q_PROPERTY(QString dataRoot READ dataRoot NOTIFY settingsChanged)
     Q_PROPERTY(QUrl dataRootUrl READ dataRootUrl NOTIFY settingsChanged)
-    Q_PROPERTY(QVariantMap communicationExperiment READ communicationExperiment NOTIFY deviceInfoChanged)
     Q_PROPERTY(bool controlling READ controlling NOTIFY deviceInfoChanged)
     Q_PROPERTY(bool controlStopping READ controlStopping NOTIFY deviceInfoChanged)
-    Q_PROPERTY(bool fullScaleDiagnosticsRunning READ fullScaleDiagnosticsRunning NOTIFY fullScaleDiagnosticsRunningChanged)
 public:
     explicit AppController(QObject *parent = nullptr);
     ~AppController() override;
@@ -65,7 +63,6 @@ public:
     QVariantMap deviceInfo() const { return m_monitoring.deviceInfo(); }
     bool controlling() const { return deviceInfo().value("controlSession").toBool(); }
     bool controlStopping() const { return deviceInfo().value("controlStopping").toBool(); }
-    bool fullScaleDiagnosticsRunning() const { return m_fullScaleDiagnosticsRunning; }
     QVariantList mfcDevices() const;
     QString runningTimeText() const;
     QString currentPointName() const { return m_currentPoint.name; }
@@ -85,12 +82,15 @@ public:
     void setWindowMode(int value);
     QString dataRoot() const { return m_config.dataRoot(); }
     QUrl dataRootUrl() const { return QUrl::fromLocalFile(m_config.dataRoot()); }
-    QVariantMap communicationExperiment() const { return deviceInfo().value("experiment").toMap(); }
 
     Q_INVOKABLE void startMonitoring();
     Q_INVOKABLE void stopMonitoring();
     Q_INVOKABLE void selectOperatingPoint(const QString &id);
     Q_INVOKABLE void saveOperatingPoint(const QVariantMap &data);
+    // Main-screen editing saves the selected customer point.  When control
+    // is active, it safely reapplies the complete point to the MFCs.
+    Q_INVOKABLE bool updateCurrentCustomerTarget(int address, double value);
+    Q_INVOKABLE QString currentTargetEditUnavailableReason() const;
     Q_INVOKABLE void duplicateOperatingPoint(const QString &id);
     Q_INVOKABLE void deleteOperatingPoint(const QString &id);
     Q_INVOKABLE void exportAlarms();
@@ -101,12 +101,9 @@ public:
     Q_INVOKABLE void rescanMfc();
     Q_INVOKABLE void confirmMfcAddress(int address);
     Q_INVOKABLE void setDataRoot(const QUrl &folderUrl);
-    Q_INVOKABLE void startCommunicationExperiment(int delayMs, int durationSeconds, int selectedAddress);
-    Q_INVOKABLE void stopCommunicationExperiment();
     Q_INVOKABLE void startControl();
     Q_INVOKABLE void stopControl();
     Q_INVOKABLE void verifyDeviceInformation();
-    Q_INVOKABLE void runFullScaleDiagnostics();
 
 signals:
     void gasChannelsChanged();
@@ -120,7 +117,6 @@ signals:
     void notificationChanged();
     void settingsChanged();
     void deviceInfoChanged();
-    void fullScaleDiagnosticsRunningChanged();
 
 private:
     void notify(const QString &message);
@@ -140,5 +136,5 @@ private:
     QString m_notification;
     QString m_communicationNotice;
     int m_alarmFilter{-1};
-    bool m_fullScaleDiagnosticsRunning{false};
+    bool m_targetUpdateInProgress{false};
 };

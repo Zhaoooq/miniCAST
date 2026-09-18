@@ -55,11 +55,16 @@ AppController::AppController(QObject *parent)
         emit deviceStatusChanged();
         m_logging.logApplication(QStringLiteral("设备状态：") + deviceStatusText());
     });
-    connect(&m_monitoring, &MonitoringController::deviceInfoChanged, this, &AppController::deviceInfoChanged);
-    connect(&m_monitoring, &MonitoringController::fullScaleDiagnosticsFinished, this, [this] {
-        if (!m_fullScaleDiagnosticsRunning) return;
-        m_fullScaleDiagnosticsRunning = false;
-        emit fullScaleDiagnosticsRunningChanged();
+    connect(&m_monitoring, &MonitoringController::deviceInfoChanged, this, [this] {
+        if (m_targetUpdateInProgress) {
+            const QString state = deviceInfo().value("operationState").toString();
+            if (state == QStringLiteral("RUNNING") || state == QStringLiteral("READ_ONLY")
+                || state == QStringLiteral("CONTROL_DEGRADED") || state == QStringLiteral("ERROR")
+                || state == QStringLiteral("IDLE")) {
+                m_targetUpdateInProgress = false;
+            }
+        }
+        emit deviceInfoChanged();
     });
     connect(&m_monitoring, &MonitoringController::flameStatusChanged, this, [this]{
         emit flameStatusChanged();
@@ -141,10 +146,6 @@ void AppController::startMonitoring()
 
 void AppController::startControl()
 {
-    if (m_fullScaleDiagnosticsRunning) {
-        notify(QStringLiteral("量程隔离诊断进行中，不能开始控制"));
-        return;
-    }
     if (m_currentPoint.id.isEmpty()) { notify(QStringLiteral("请先选择有效运行点")); return; }
     QString error; if (!validateTargetFlows(m_currentPoint, &error)) { notify(error); return; }
     m_monitoring.startControl(m_currentPoint);
@@ -161,23 +162,9 @@ void AppController::stopControl()
 
 void AppController::verifyDeviceInformation()
 {
-    if (m_fullScaleDiagnosticsRunning) {
-        notify(QStringLiteral("量程隔离诊断进行中，不能执行设备信息核验"));
-        return;
-    }
     if (controlling()) { notify(QStringLiteral("请先停止控制，再执行只读设备信息核验")); return; }
     m_monitoring.verifyDeviceInformation();
     notify(QStringLiteral("正在读取设备信息；此操作不会向 MFC 写入任何参数"));
-}
-
-void AppController::runFullScaleDiagnostics()
-{
-    if (m_fullScaleDiagnosticsRunning) return;
-    if (controlling()) { notify(QStringLiteral("请先停止控制，再执行只读 Full Scale 诊断")); return; }
-    m_fullScaleDiagnosticsRunning = true;
-    emit fullScaleDiagnosticsRunningChanged();
-    m_monitoring.runFullScaleDiagnostics();
-    notify(QStringLiteral("正在执行只读量程诊断：每台重复 10 次，并交错读取地址 32/34"));
 }
 
 void AppController::stopMonitoring()
@@ -185,28 +172,6 @@ void AppController::stopMonitoring()
     if (!monitoring()) return;
     m_monitoring.stopMonitoring();
     notify(QStringLiteral("正在停止数据采集；设备控制参数保持不变"));
-}
-
-void AppController::startCommunicationExperiment(int delayMs, int durationSeconds,
-                                                  int selectedAddress)
-{
-    if (monitoring()) {
-        notify(QStringLiteral("请先停止常规监测，再开始通信实验"));
-        return;
-    }
-    if (delayMs != 200 || !QList<int>{300, 600}.contains(durationSeconds)
-        || (selectedAddress != 0 && (selectedAddress < 32 || selectedAddress > 36))) {
-        notify(QStringLiteral("实验参数无效"));
-        return;
-    }
-    m_monitoring.startCommunicationExperiment(delayMs, durationSeconds, selectedAddress);
-    notify(QStringLiteral("正在启动严格只读的 CS200 READ_FLOW 通信实验"));
-}
-
-void AppController::stopCommunicationExperiment()
-{
-    m_monitoring.stopCommunicationExperiment();
-    notify(QStringLiteral("正在停止 CS200 通信实验并生成报告"));
 }
 
 void AppController::selectOperatingPoint(const QString &id)
@@ -265,6 +230,68 @@ void AppController::saveOperatingPoint(const QVariantMap &d)
         refreshCurrentPointMatch();
     }
     notify(ok ? QStringLiteral("运行点已保存") : QStringLiteral("运行点保存失败或系统预设不可修改"));
+}
+
+QString AppController::currentTargetEditUnavailableReason() const
+{
+    if (m_targetUpdateInProgress)
+        return QStringLiteral("正在安全下发新的运行点，请等待核验完成");
+    if (m_currentPoint.id.isEmpty())
+        return QStringLiteral("请先在运行点页面选择一个客户运行点");
+
+    const auto point = m_points.point(m_currentPoint.id);
+    if (point.id.isEmpty() || point.readOnly || point.isFactoryDefault())
+        return QStringLiteral("主界面仅可直接修改已选择的客户运行点");
+
+    if (controlStopping())
+        return QStringLiteral("正在停止控制，确认所有目标流量归零后才能修改运行点");
+    return {};
+}
+
+bool AppController::updateCurrentCustomerTarget(int address, double value)
+{
+    const QString unavailableReason = currentTargetEditUnavailableReason();
+    if (!unavailableReason.isEmpty()) {
+        notify(unavailableReason);
+        return false;
+    }
+
+    OperatingPoint updated = m_points.point(m_currentPoint.id);
+    if (!updated.mfcSetpoints.contains(address)) {
+        notify(QStringLiteral("当前运行点不包含 MFC 地址 %1").arg(address));
+        return false;
+    }
+    updated.mfcSetpoints[address] = value;
+
+    QString validationError;
+    if (!validateTargetFlows(updated, &validationError)) {
+        notify(validationError);
+        return false;
+    }
+    if (!m_points.addOrUpdate(updated)) {
+        notify(QStringLiteral("目标流量保存失败"));
+        return false;
+    }
+
+    const bool wasControlling = controlling();
+    m_currentPoint = m_points.point(updated.id);
+    if (wasControlling) {
+        // applyOperatingPoint performs Digital → Hold → Load → Verify →
+        // Follow for all enabled MFCs, so a live edit never writes a lone
+        // channel while the others are still following their old point.
+        m_targetUpdateInProgress = true;
+        m_monitoring.startControl(m_currentPoint);
+    } else {
+        // Outside control this remains a read-only comparison-target update.
+        m_monitoring.selectOperatingPoint(m_currentPoint);
+    }
+    emit currentPointChanged();
+    m_logging.logApplication(QStringLiteral("主界面修改客户运行点：%1，地址 %2 目标流量=%3")
+                             .arg(m_currentPoint.name).arg(address).arg(value, 0, 'f', 3));
+    notify(wasControlling
+           ? QStringLiteral("正在安全下发 %1：Hold → 下发 → 核验 → Follow").arg(m_currentPoint.name)
+           : QStringLiteral("已更新 %1 的目标流量；开始控制前不会写入 MFC").arg(m_currentPoint.name));
+    return true;
 }
 
 OperatingPoint AppController::pointFromCurrentTargets() const

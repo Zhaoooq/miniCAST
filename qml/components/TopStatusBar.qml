@@ -54,7 +54,7 @@ Rectangle {
             text: appController.controlStopping ? "正在停止…" : (appController.controlling ? "停止控制" : "开始控制")
             implicitWidth: 92
             implicitHeight: 34
-            enabled: !appController.fullScaleDiagnosticsRunning && !appController.controlStopping && (appController.controlling || appController.currentPointId.length > 0)
+            enabled: !appController.controlStopping && (appController.controlling || appController.currentPointId.length > 0)
             primary: !appController.controlling
             danger: appController.controlling
             onClicked: appController.controlling ? root.stopRequested() : appController.startControl()

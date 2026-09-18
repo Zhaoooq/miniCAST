@@ -53,12 +53,9 @@ public:
     void selectOperatingPoint(const OperatingPoint &point);
     void setLogDirectory(const QString &directory);
     void setAddressConfirmed(int address, bool confirmed);
-    void startCommunicationExperiment(int delayMs, int durationSeconds, int selectedAddress);
-    void stopCommunicationExperiment();
     void startControl(const OperatingPoint &point);
     void stopControl();
     void verifyDeviceInformation();
-    void runFullScaleDiagnostics();
 
 public slots:
     void startMonitoring();
@@ -73,7 +70,6 @@ signals:
     void errorOccurred(const QString &message);
     void communicationNoticeChanged(const QString &message);
     void deviceInfoChanged();
-    void fullScaleDiagnosticsFinished();
 private slots:
     void onFlows(const QList<GasChannel> &channels);
     void onDeviceStatus(DeviceStatus status);

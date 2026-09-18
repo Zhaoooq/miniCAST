@@ -6,10 +6,41 @@ import MiniCastMonitor
 Item {
     id: root
     property var selectedChannel: ({})
+    property var editingChannel: ({})
+
+    function configuredDevice(address) {
+        for (var i = 0; i < appController.mfcDevices.length; ++i) {
+            if (Number(appController.mfcDevices[i].address) === Number(address))
+                return appController.mfcDevices[i]
+        }
+        return ({})
+    }
 
     function openDetails(channel) {
         selectedChannel = channel
         detailDialog.open()
+    }
+
+    function editTarget(channel) {
+        var unavailableReason = appController.currentTargetEditUnavailableReason()
+        if (unavailableReason.length) {
+            targetEditNotice.message = unavailableReason
+            targetEditNotice.open()
+            return
+        }
+
+        var device = configuredDevice(channel.address)
+        var maximum = Number(device.maxSetpoint > 0 ? device.maxSetpoint : device.fullScale)
+        if (!(maximum > 0)) {
+            targetEditNotice.message = "此 MFC 的目标流量范围尚未配置"
+            targetEditNotice.open()
+            return
+        }
+
+        editingChannel = channel
+        targetKeypad.openFor((channel.name || "MFC " + channel.address) + "目标流量",
+                             channel.targetFlow, Number(device.minSetpoint || 0), maximum,
+                             device.unit || channel.flowUnit || "", false, 3, [], true)
     }
 
     RowLayout {
@@ -29,8 +60,23 @@ Item {
                 Layout.minimumWidth: 0
                 channel: modelData
                 onDetailsRequested: root.openDetails(modelData)
+                onTargetEditRequested: root.editTarget(modelData)
             }
         }
+    }
+
+    TouchNumericKeypadDialog {
+        id: targetKeypad
+        onValueAccepted: function(value) {
+            appController.updateCurrentCustomerTarget(Number(root.editingChannel.address), value)
+        }
+    }
+
+    HmiDialog {
+        id: targetEditNotice
+        title: "无法修改目标流量"
+        acceptText: "知道了"
+        rejectText: "关闭"
     }
 
     Dialog {

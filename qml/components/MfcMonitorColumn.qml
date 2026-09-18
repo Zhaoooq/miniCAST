@@ -6,6 +6,7 @@ Rectangle {
     id: root
     property var channel: ({})
     signal detailsRequested()
+    signal targetEditRequested()
 
     readonly property real fullScale: Number(channel.fullScaleValue || 0)
     // Actual presentation has exactly one telemetry source: actualFlow.  Do
@@ -53,19 +54,14 @@ Rectangle {
             }
             Text {
                 Layout.fillWidth: true
-                text: channel.name || ("MFC " + (channel.address || "—"))
+                text: channel.gasType && channel.gasType !== "待确认" ? channel.gasType : "气体未配置"
                 color: Theme.textPrimary; font.pixelSize: 12; font.weight: Font.DemiBold; elide: Text.ElideRight
             }
         }
 
         Text {
             Layout.fillWidth: true; Layout.preferredHeight: 15
-            text: channel.gasType && channel.gasType !== "待确认" ? channel.gasType : "气体未配置"
-            color: Theme.textSecondary; font.pixelSize: 10; elide: Text.ElideRight
-        }
-        Text {
-            Layout.fillWidth: true; Layout.preferredHeight: 14
-            text: "地址 " + (channel.address || "—")
+            text: channel.name || "MFC —"
             color: Theme.textSecondary; font.pixelSize: 10; elide: Text.ElideRight
         }
 
@@ -74,9 +70,15 @@ Rectangle {
             Layout.preferredHeight: 28
             spacing: 4
             ColumnLayout {
+                id: targetFlowDisplay
                 Layout.fillWidth: true; spacing: -2
                 Text { Layout.fillWidth: true; text: root.targetAvailable ? "目标 " + Number(channel.targetFlow).toFixed(1) : "目标 —"; color: Theme.targetFlow; font.pixelSize: 11; font.weight: Font.DemiBold; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight }
-                Text { Layout.fillWidth: true; text: root.targetAvailable ? root.displayUnit : ""; color: Theme.textSecondary; font.pixelSize: 9; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight }
+                Text { Layout.fillWidth: true; text: root.displayUnit; color: Theme.textSecondary; font.pixelSize: 9; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight }
+                // Keep the target area separate from the card-wide details
+                // gesture, so a single touch edits the customer run point.
+                TapHandler {
+                    onTapped: root.targetEditRequested()
+                }
             }
             ColumnLayout {
                 Layout.fillWidth: true; spacing: -2
@@ -90,17 +92,23 @@ Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
             Layout.minimumHeight: 118
-            readonly property real trackWidth: Math.min(30, Math.max(18, width * 0.23))
-            readonly property real trackHeight: Math.max(1, height - 18)
-            readonly property real trackY: 9
+            // The removed address row leaves its height to this fill item,
+            // making the gauges taller.  A wider track keeps the values
+            // legible on the five-column main view.
+            readonly property real trackWidth: Math.min(60, Math.max(24, width * 0.40))
+            readonly property real trackY: 14
+            readonly property real trackHeight: Math.max(1, height - trackY - 9)
             readonly property real targetX: width * 0.25 - trackWidth / 2
             readonly property real actualX: width * 0.75 - trackWidth / 2
             // Identical full scale, zero origin, height and formula for both bars.
             function fillY(fraction) { return trackY + trackHeight * (1 - fraction) }
             function markerY(fraction) { return Math.max(trackY + 1, Math.min(trackY + trackHeight - 3, fillY(fraction) - 1)) }
 
-            Text { x: 0; y: 1; width: Math.max(1, gauges.targetX - 3); text: root.fullScale > 0 ? Number(root.fullScale).toFixed(root.fullScale < 10 ? 1 : 0) : "—"; color: Theme.textSecondary; font.pixelSize: 9; horizontalAlignment: Text.AlignRight; elide: Text.ElideLeft }
-            Text { x: 0; y: gauges.trackY + gauges.trackHeight - 8; width: Math.max(1, gauges.targetX - 3); text: "0"; color: Theme.textSecondary; font.pixelSize: 9; horizontalAlignment: Text.AlignRight }
+            // Wide tracks leave too little space at their left edge for
+            // values such as 1.0 and 4.0.  Keep the shared scale legible by
+            // anchoring it above and below the target-flow track instead.
+            Text { x: gauges.targetX; y: 1; width: gauges.trackWidth; text: root.fullScale > 0 ? Number(root.fullScale).toFixed(root.fullScale < 10 ? 1 : 0) : "—"; color: Theme.textSecondary; font.pixelSize: 9; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideNone }
+            Text { x: gauges.targetX; y: gauges.trackY + gauges.trackHeight; width: gauges.trackWidth; text: "0"; color: Theme.textSecondary; font.pixelSize: 9; horizontalAlignment: Text.AlignHCenter }
 
             Repeater {
                 model: [ { x: gauges.targetX, fraction: root.targetFraction, available: root.targetAvailable, color: Theme.targetFlow }, { x: gauges.actualX, fraction: root.actualFraction, available: root.actualAvailable, color: Theme.gaugeFill } ]
@@ -113,12 +121,27 @@ Rectangle {
             }
         }
 
-        Text { Layout.fillWidth: true; Layout.preferredHeight: 14; text: root.displayUnit || "—"; color: Theme.textSecondary; font.pixelSize: 10; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight }
-        Text { Layout.fillWidth: true; Layout.preferredHeight: 15; text: "偏差 " + (channel.deviationAvailable && root.actualAvailable ? (Number(channel.deviation) >= 0 ? "+" : "") + Number(channel.deviation).toFixed(2) : "—"); color: root.statusColor; font.pixelSize: 10; horizontalAlignment: Text.AlignHCenter }
-        Text { Layout.fillWidth: true; Layout.preferredHeight: 15; text: "偏差率 " + (channel.deviationAvailable && root.actualAvailable ? (Number(channel.deviationPercent) >= 0 ? "+" : "") + Number(channel.deviationPercent).toFixed(1) + "%" : "—"); color: root.statusColor; font.pixelSize: 10; horizontalAlignment: Text.AlignHCenter }
-        Text { Layout.fillWidth: true; Layout.preferredHeight: 15; text: channel.effectiveSetpointState || channel.stopState || "尚未应用设定"; color: channel.stopFailure || channel.effectiveSetpointState === "有效设定未确认" ? Theme.red : (channel.effectiveSetpointState === "有效设定已同步" ? Theme.green : Theme.textSecondary); font.pixelSize: 10; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight }
-        Text { Layout.fillWidth: true; Layout.preferredHeight: 28; text: root.statusText; color: root.statusColor; font.pixelSize: 11; font.weight: Font.DemiBold; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; wrapMode: Text.Wrap; elide: Text.ElideRight }
+        // Keep only the two flow-comparison values beneath the gauges. This
+        // reserves the rest of the fixed-height card for the bar display.
+        Text {
+            Layout.fillWidth: true; Layout.preferredHeight: 15
+            text: "偏差 " + (channel.deviationAvailable && root.actualAvailable ? (Number(channel.deviation) >= 0 ? "+" : "") + Number(channel.deviation).toFixed(2) : "—")
+                + "  ·  " + (channel.deviationAvailable && root.actualAvailable ? (Number(channel.deviationPercent) >= 0 ? "+" : "") + Number(channel.deviationPercent).toFixed(1) + "%" : "偏差率 —")
+            color: root.statusColor; font.pixelSize: 10
+            horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight
+        }
     }
 
-    TapHandler { onTapped: root.detailsRequested() }
+    TapHandler {
+        // Pointer handlers can both observe a tap.  Exclude the target area
+        // explicitly so it never also opens the device-details dialog.
+        onTapped: function(eventPoint) {
+            var targetOrigin = targetFlowDisplay.mapToItem(root, 0, 0)
+            var inTargetArea = eventPoint.position.x >= targetOrigin.x
+                && eventPoint.position.x <= targetOrigin.x + targetFlowDisplay.width
+                && eventPoint.position.y >= targetOrigin.y
+                && eventPoint.position.y <= targetOrigin.y + targetFlowDisplay.height
+            if (!inTargetArea) root.detailsRequested()
+        }
+    }
 }
